@@ -1,9 +1,9 @@
 import * as p from "@clack/prompts"
 import { loadGlobalConfig, writeGlobalConfig } from "../utils/config"
 import {
-  fetchDopplerSecrets,
-  fetchDopplerProjects,
   fetchDopplerConfigs,
+  fetchDopplerProjects,
+  fetchDopplerSecrets,
 } from "../utils/doppler"
 import { listObjects } from "../utils/r2"
 import type { GlobalConfig } from "../utils/types"
@@ -120,7 +120,7 @@ export async function promptR2Credentials(global: GlobalConfig): Promise<void> {
 
   const bucket = await p.text({
     message: "R2 Bucket Name",
-    initialValue: global.r2.bucket ?? "r2git-backups",
+    initialValue: global.r2.bucket ?? "r2git",
   })
   if (p.isCancel(bucket)) {
     p.cancel("Cancelled.")
@@ -186,7 +186,7 @@ async function importSecretsFromDoppler(
       accountId,
       accessKeyId,
       secretAccessKey,
-      bucket: bucket ?? global.r2.bucket ?? "r2git-backups",
+      bucket: bucket ?? global.r2.bucket ?? "r2git",
     }
     global.dopplerToken = token
     await writeGlobalConfig(global)

@@ -1,12 +1,12 @@
+import { homeDir } from "./fs"
 import type {
-  ProjectConfig,
+  BackupConfig,
   GlobalConfig,
   LocalConfig,
-  ResolvedConfig,
-  BackupConfig,
+  ProjectConfig,
   R2Config,
+  ResolvedConfig,
 } from "./types"
-import { homeDir } from "./fs"
 
 const CONFIG_FILENAME = ".r2gitrc"
 const LEGACY_MIGRATE_FILENAME = ".migraterc"
@@ -66,9 +66,7 @@ export function defaultConfig(): GlobalConfig {
         process.env.R2_SECRET_ACCESS_KEY ??
         process.env.CLOUDFLARE_SECRET_ACCESS_KEY,
       bucket:
-        process.env.R2_BUCKET ??
-        process.env.CLOUDFLARE_R2_BUCKET ??
-        "r2git-backups",
+        process.env.R2_BUCKET ?? process.env.CLOUDFLARE_R2_BUCKET ?? "r2git",
     },
     dopplerToken: undefined,
   }

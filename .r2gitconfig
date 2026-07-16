@@ -1,0 +1,11 @@
+{
+  "project": "iamvikshan/r2it",
+  "backup": {
+    "retention": 5,
+    "paths": [
+      "/root/.gemini/config",
+      "/root/.gemini/antigravity-cli/antigravity-oauth-token",
+      "/root/.gemini/antigravity-cli/settings.json"
+    ]
+  }
+}

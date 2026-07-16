@@ -112,7 +112,6 @@ export async function cmdPull(args: string[]): Promise<void> {
       : null
   const dryRun = args.includes("--dry-run") || args.includes("-n")
   const interactive = args.includes("--interactive") || args.includes("-i")
-  const yes = args.includes("-y") || args.includes("--yes")
 
   const pkgPrefix = cfg.backup.prefix
   const r2Prefix = projectR2Prefix(cfg.project, pkgPrefix)
@@ -123,17 +122,6 @@ export async function cmdPull(args: string[]): Promise<void> {
     console.log(`\n[dry-run] Project: ${cfg.project}`)
     console.log(`[dry-run] Would download and restore backup: ${key}\n`)
     return
-  }
-
-  if (!yes) {
-    const ok = await p.confirm({
-      message: `Pull and restore backup '${key}' into local workspace?`,
-      initialValue: true,
-    })
-    if (p.isCancel(ok) || !ok) {
-      p.cancel("Operation cancelled.")
-      process.exit(0)
-    }
   }
 
   await performPull(cfg, key)

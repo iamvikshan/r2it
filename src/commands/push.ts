@@ -151,7 +151,6 @@ export async function cmdPush(args: string[]): Promise<void> {
       ? (args[prefixIdx + 1] ?? cfg.backup.prefix)
       : cfg.backup.prefix
   const dryRun = args.includes("--dry-run") || args.includes("-n")
-  const yes = args.includes("-y") || args.includes("--yes")
 
   const r2Prefix = projectR2Prefix(cfg.project, pkgPrefix)
   const key = `${r2Prefix}${utcStamp()}.tar.gz`
@@ -176,17 +175,6 @@ export async function cmdPush(args: string[]): Promise<void> {
     console.log(`[dry-run] Would upload to R2 as: ${key}`)
     console.log(`[dry-run] Would retain ${retention} most recent backups\n`)
     return
-  }
-
-  if (!yes) {
-    const ok = await p.confirm({
-      message: `Push backup for '${cfg.project}' (${existingPaths.length} paths) to R2?`,
-      initialValue: true,
-    })
-    if (p.isCancel(ok) || !ok) {
-      p.cancel("Operation cancelled.")
-      process.exit(0)
-    }
   }
 
   await performPush(cfg, key, existingPaths, retention, r2Prefix)

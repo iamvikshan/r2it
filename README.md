@@ -32,10 +32,10 @@ To install globally:
 
 ```bash
 # Using Bun (Recommended)
-bun add -g r2git
+bun add -g @syncron/r2git
 
 # Using npm
-npm install -g r2git
+npm install -g @syncron/r2git
 ```
 
 ---
@@ -87,7 +87,7 @@ keys. **Do not commit this.**
     "accountId": "your-r2-account-id",
     "accessKeyId": "your-access-key-id",
     "secretAccessKey": "your-secret-access-key",
-    "bucket": "my-backups"
+    "bucket": "r2git"
   }
 }
 ```

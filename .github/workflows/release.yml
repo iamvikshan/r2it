@@ -142,10 +142,10 @@ jobs:
           token: ${{ secrets.GH_TOKEN }}
 
       - name: Setup Bun runtime and dependencies
-        uses: iamvikshan/.github/.github/actions/bun@main
+        uses: iamvikshan/.github/.github/actions/bun-node@main
 
       - name: Build JS bundle and OS binaries
-        run: bun run build:all
+        run: bun run build
 
       - name: Archive binaries for GitHub Release
         run: |
@@ -203,11 +203,7 @@ jobs:
           git push -f "$TEMP_URL" ${{ needs.prepare.outputs.new_tag }}
 
       - name: Publish to NPM Registry
-        run: |
-          echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" > ~/.npmrc
-          npm publish --provenance --access public
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public
 
       - name: Publish GitHub Release with Archived Binaries
         uses: softprops/action-gh-release@v3.0.2

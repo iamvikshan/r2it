@@ -7,7 +7,7 @@ export function buildJS(outfile = "dist/index.js"): boolean {
     "--target=bun",
     "--outfile",
     outfile,
-    "--banner.js=#!/usr/bin/env bun",
+    "--banner=#!/usr/bin/env bun",
   ])
   if (!proc.success) {
     console.error(`JS build failed: ${proc.stderr.toString()}`)
