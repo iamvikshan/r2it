@@ -1,0 +1,35 @@
+{
+  "name": "Ubuntu + Bun",
+  "image": "ghcr.io/iamvikshan/devcontainer/agents:latest",
+  "features": {
+    "ghcr.io/devcontainers/features/sshd:1.1.0": {
+      "version": "latest"
+    }
+  },
+  "runArgs": ["--network=host"],
+  "forwardPorts": [20128],
+  "portsAttributes": {
+    "20128": {
+      "label": "omniroute",
+      "onAutoForward": "notify"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "oven.bun-vscode",
+        "WakaTime.vscode-wakatime",
+        "coderabbit.coderabbit-vscode",
+        "aaron-bond.better-comments",
+        "usernamehw.errorlens",
+        "TypeScriptTeam.native-preview",
+        "eamodio.gitlens",
+        "oxc.oxc-vscode",
+        "github.vscode-github-actions"
+      ]
+    }
+  },
+  "remoteUser": "root",
+  "postCreateCommand": "bun upd && bun bs --default",
+  "postStartCommand": "nohup omniroute serve > /tmp/omniroute.log 2>&1 &"
+}

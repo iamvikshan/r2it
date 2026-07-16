@@ -1,0 +1,225 @@
+name: Release Platheria
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "package.json"
+  workflow_dispatch:
+    inputs:
+      tag_override:
+        description:
+          "Override auto-tag (e.g., v3.0.0) — leave empty for auto-increment"
+        required: false
+        default: ""
+        type: string
+      bump_type:
+        description: "Force bump type when override is empty"
+        required: false
+        default: "patch"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      prerelease:
+        description: "Mark as prerelease"
+        required: false
+        default: false
+        type: boolean
+      draft:
+        description: "Create as draft"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Resolve Version & Release Metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      new_tag: ${{ steps.resolve.outputs.new_tag }}
+      is_prerelease: ${{ steps.detect.outputs.prerelease }}
+      is_draft: ${{ steps.detect.outputs.draft }}
+      make_latest: ${{ steps.detect.outputs.make_latest }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: Resolve tag from manual dispatch input
+        id: tag_override
+        if:
+          github.event_name == 'workflow_dispatch' && inputs.tag_override != ''
+        run: |
+          if echo "${{ inputs.tag_override }}" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+            echo "new_tag=${{ inputs.tag_override }}" >> $GITHUB_OUTPUT
+          else
+            echo "Error: Invalid tag override format '${{ inputs.tag_override }}'"
+            exit 1
+          fi
+
+      - name: Resolve tag from HEAD commit directive
+        id: tag_from_commit
+        if: steps.tag_override.outputs.new_tag == ''
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          TAG=$(echo "$COMMIT_MSG" | grep -oE '\[release:\s*v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?\]' | head -1 | sed -E 's/\[release:\s*//; s/\]//')
+          if [ -z "$TAG" ]; then
+            TAG=$(echo "$COMMIT_MSG" | grep -oE '^release:\s*v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?' | head -1 | sed -E 's/^release:\s*//')
+          fi
+          echo "new_tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Calculate auto-bump version from conventional commits
+        id: auto_tag
+        if:
+          steps.tag_override.outputs.new_tag == '' &&
+          steps.tag_from_commit.outputs.new_tag == ''
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GH_TOKEN }}
+          default_bump: ${{ github.event.inputs.bump_type || 'patch' }}
+          release_branches: main
+          dry_run: true
+
+      - name: Consolidate final release tag
+        id: resolve
+        run: |
+          TAG="${{
+            steps.tag_override.outputs.new_tag ||
+            steps.tag_from_commit.outputs.new_tag ||
+            steps.auto_tag.outputs.new_tag
+          }}"
+          if [ -z "$TAG" ]; then
+            echo "No tag resolved. Skipping release."
+            echo "new_tag=" >> $GITHUB_OUTPUT
+          else
+            echo "new_tag=$TAG" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure release environment flags
+        id: detect
+        if: steps.resolve.outputs.new_tag != ''
+        run: |
+          TAG="${{ steps.resolve.outputs.new_tag }}"
+          if [ "${{ github.event.inputs.draft }}" == "true" ] || echo "$TAG" | grep -iq 'alpha'; then
+            echo "draft=true" >> $GITHUB_OUTPUT
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+            echo "make_latest=false" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.inputs.prerelease }}" == "true" ] || echo "$TAG" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(-.*)+$'; then
+            echo "draft=false" >> $GITHUB_OUTPUT
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+            echo "make_latest=false" >> $GITHUB_OUTPUT
+          else
+            echo "draft=false" >> $GITHUB_OUTPUT
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+            echo "make_latest=true" >> $GITHUB_OUTPUT
+          fi
+
+  publish:
+    name: Build, Distribute & Publish
+    needs: prepare
+    if: needs.prepare.outputs.new_tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: Setup Bun runtime and dependencies
+        uses: iamvikshan/.github/.github/actions/bun@main
+
+      - name: Build JS bundle and OS binaries
+        run: bun run build:all
+
+      - name: Archive binaries for GitHub Release
+        run: |
+          cd dist
+          tar -czf migrate-linux-x64.tar.gz migrate-linux-x64
+          tar -czf migrate-linux-arm64.tar.gz migrate-linux-arm64
+          tar -czf migrate-macos-x64.tar.gz migrate-macos-x64
+          tar -czf migrate-macos-arm64.tar.gz migrate-macos-arm64
+          zip -q migrate-windows-x64.zip migrate-windows-x64.exe
+          cd ..
+
+      - name: Update package.json version and synchronize lockfile
+        run: |
+          VERSION=$(echo "${{ needs.prepare.outputs.new_tag }}" | sed 's/^v//')
+          jq --indent 2 --arg v "$VERSION" '.version = $v | del(.private)' package.json > package.json.tmp
+          mv package.json.tmp package.json
+          bun install --lockfile-only
+
+      - name: Prepare temporary upstream tags for changelog generation
+        run: |
+          TEMP_URL="https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          TAG_COUNT=$(git tag -l | wc -l)
+          if [ "$TAG_COUNT" -eq 0 ]; then
+            ROOT_COMMIT=$(git rev-list --max-parents=0 HEAD | tail -n 1)
+            git tag v0.0.0-0.root $ROOT_COMMIT
+            git push "$TEMP_URL" v0.0.0-0.root
+          fi
+          git tag -f ${{ needs.prepare.outputs.new_tag }}
+          git push -f "$TEMP_URL" ${{ needs.prepare.outputs.new_tag }}
+
+      - name: Generate release changelog
+        uses: requarks/changelog-action@v1.10.3
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          tag: ${{ needs.prepare.outputs.new_tag }}
+          writeToFile: true
+
+      - name:
+          Execute checkmate cleanup, commit artifacts, and push final release
+        run: |
+          TEMP_URL="https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git push "$TEMP_URL" --delete ${{ needs.prepare.outputs.new_tag }} 2>/dev/null || true
+          if git rev-parse -q --verify "refs/tags/v0.0.0-0.root" >/dev/null; then
+            git push "$TEMP_URL" --delete v0.0.0-0.root 2>/dev/null || true
+            git tag -d v0.0.0-0.root 2>/dev/null || true
+          fi
+          git config user.name "iamvikshan"
+          git config user.email "vixshan@gmail.com"
+          git add package.json CHANGELOG.md bun.lock* 2>/dev/null || true
+          if ! git diff --staged --quiet; then
+            git commit -m "chore(release): ${{ needs.prepare.outputs.new_tag }} [skip ci]"
+            git push "$TEMP_URL" HEAD:${{ github.ref_name }}
+          fi
+          git tag -f ${{ needs.prepare.outputs.new_tag }} HEAD
+          git push -f "$TEMP_URL" ${{ needs.prepare.outputs.new_tag }}
+
+      - name: Publish to NPM Registry
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" > ~/.npmrc
+          npm publish --provenance --access public
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish GitHub Release with Archived Binaries
+        uses: softprops/action-gh-release@v3.0.2
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          tag_name: ${{ needs.prepare.outputs.new_tag }}
+          name: ${{ needs.prepare.outputs.new_tag }}
+          body_path: CHANGELOG.md
+          prerelease: ${{ needs.prepare.outputs.is_prerelease == 'true' }}
+          draft: ${{ needs.prepare.outputs.is_draft == 'true' }}
+          make_latest: ${{ needs.prepare.outputs.make_latest }}
+          generate_release_notes: false
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
