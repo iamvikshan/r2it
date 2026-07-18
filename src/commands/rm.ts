@@ -4,7 +4,7 @@ import {
   writeLocalConfig,
   LOCAL_CONFIG_FILENAME,
 } from "../utils/config"
-import { resolvePath, buildPathContext } from "../utils/fs"
+import { resolvePath, buildPathContext, isPathUnderBase } from "../utils/fs"
 import { info, warn } from "../utils/log"
 
 export async function cmdRm(args: string[]): Promise<void> {
@@ -55,10 +55,10 @@ export async function cmdRm(args: string[]): Promise<void> {
 
     // Also try resolving the input to see if it matches any stored path
     const absPath = resolvePath(path, ctx)
-    if (absPath.startsWith(ctx.cwd)) {
+    if (isPathUnderBase(absPath, ctx.cwd)) {
       matchers.push(`{cwd}/${absPath.slice(ctx.cwd.length).replace(/^\//, "")}`)
     }
-    if (absPath.startsWith(ctx.home)) {
+    if (isPathUnderBase(absPath, ctx.home)) {
       matchers.push(`{home}/${absPath.slice(ctx.home.length).replace(/^\//, "")}`)
     }
 

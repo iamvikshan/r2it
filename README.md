@@ -105,7 +105,7 @@ r2git uses a git-like storage model:
 2. **Objects stored by hash** in R2: `projects/org/repo/objects/a3/8f2c...d4`
 3. **Manifests** map file paths to hashes: `projects/org/repo/manifests/2026-07-18T07-58Z.json`
 4. **Push** diffs local hashes against the latest remote manifest — uploads only new/changed objects
-5. **Pull** compares local file hashes against the manifest — downloads only missing objects
+5. **Pull** compares local file hashes against the manifest — downloads and overwrites files whose local hashes are missing or differ
 6. **Symlinks** are individually tarred and stored as special objects
 
 ### R2 Storage Layout

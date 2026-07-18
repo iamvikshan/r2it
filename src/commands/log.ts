@@ -26,85 +26,89 @@ export async function cmdLog(args: string[]): Promise<void> {
   const s = p.spinner()
   s.start("Querying backup history...")
 
-  // Try manifest-based history first
+  // Query both manifest and legacy tar backups
+  let manifests: Array<{ key: string; lastModified: string; size: number }> = []
   try {
-    const manifests = await listManifests(cfg.r2, r2Prefix)
-    if (manifests.length > 0) {
-      s.stop(`Found ${manifests.length} manifest(s).`)
-
-      console.log(
-        `\nHistory for project "${cfg.project}" (${manifests.length} backups):`,
-      )
-      console.log("─".repeat(70))
-
-      for (const m of manifests) {
-        const date = new Date(m.lastModified).toLocaleString()
-        const size = formatSize(m.size)
-
-        if (detailed) {
-          // Download manifest to show entry counts
-          try {
-            const manifest = await downloadManifest(cfg.r2, m.key)
-            const entries = Object.keys(manifest.entries).length
-            const totalSize = Object.values(manifest.entries).reduce(
-              (sum, e) => sum + e.size,
-              0,
-            )
-            const keyParts = m.key.split("/")
-            const filename = keyParts[keyParts.length - 1] ?? m.key
-            console.log(`  backup ${filename}`)
-            console.log(`  Date:     ${date}`)
-            console.log(`  Size:     ${size}`)
-            console.log(`  Entries:  ${entries} file(s), ${formatSize(totalSize)} content`)
-            if (manifest.parent) {
-              console.log(`  Parent:   ${manifest.parent.split("/").pop()}`)
-            }
-          } catch {
-            const keyParts = m.key.split("/")
-            const filename = keyParts[keyParts.length - 1] ?? m.key
-            console.log(`  backup ${filename}`)
-            console.log(`  Date:   ${date}`)
-            console.log(`  Size:   ${size}`)
-          }
-        } else {
-          const keyParts = m.key.split("/")
-          const filename = keyParts[keyParts.length - 1] ?? m.key
-          console.log(`  backup ${filename}`)
-          console.log(`  Date:   ${date}`)
-          console.log(`  Size:   ${size}`)
-        }
-        console.log("─".repeat(70))
-      }
-      return
-    }
+    manifests = await listManifests(cfg.r2, r2Prefix)
   } catch {
-    // Fall through to legacy tar listing
+    // Failed to list manifests, continue to legacy
   }
 
-  // Legacy: list tar files
+  let legacyBackups: Array<{ key: string; lastModified: string; size: number }> = []
   try {
     const all = await listObjects(cfg.r2, r2Prefix)
-    const backups = all
+    legacyBackups = all
       .filter(a => a.key.endsWith(".tar.gz"))
       .sort(
         (a, b) =>
           new Date(b.lastModified).getTime() -
           new Date(a.lastModified).getTime(),
       )
-    s.stop("History loaded.")
+  } catch {
+    // Failed to list legacy backups
+  }
 
-    if (backups.length === 0) {
-      console.log(
-        `No backups found for project "${cfg.project}" under prefix "${r2Prefix}".`,
-      )
-      return
-    }
+  s.stop("History loaded.")
 
+  // Display manifests if found
+  if (manifests.length > 0) {
     console.log(
-      `\nHistory for project "${cfg.project}" (${backups.length} legacy backups):`,
+      `\nHistory for project "${cfg.project}" (${manifests.length} manifest backups):`,
     )
     console.log("─".repeat(70))
-    for (const b of backups) {
+
+    for (const m of manifests) {
+      const date = new Date(m.lastModified).toLocaleString()
+      const size = formatSize(m.size)
+
+      if (detailed) {
+        // Download manifest to show entry counts
+        try {
+          const manifest = await downloadManifest(cfg.r2, m.key)
+          const entries = Object.keys(manifest.entries).length
+          const totalSize = Object.values(manifest.entries).reduce(
+            (sum, e) => sum + e.size,
+            0,
+          )
+          const keyParts = m.key.split("/")
+          const filename = keyParts[keyParts.length - 1] ?? m.key
+          console.log(`  backup ${filename}`)
+          console.log(`  Date:     ${date}`)
+          console.log(`  Size:     ${size}`)
+          console.log(`  Entries:  ${entries} file(s), ${formatSize(totalSize)} content`)
+          if (manifest.parent) {
+            console.log(`  Parent:   ${manifest.parent.split("/").pop()}`)
+          }
+        } catch {
+          const keyParts = m.key.split("/")
+          const filename = keyParts[keyParts.length - 1] ?? m.key
+          console.log(`  backup ${filename}`)
+          console.log(`  Date:   ${date}`)
+          console.log(`  Size:   ${size}`)
+        }
+      } else {
+        const keyParts = m.key.split("/")
+        const filename = keyParts[keyParts.length - 1] ?? m.key
+        console.log(`  backup ${filename}`)
+        console.log(`  Date:   ${date}`)
+        console.log(`  Size:   ${size}`)
+      }
+      console.log("─".repeat(70))
+    }
+  }
+
+  // Display legacy backups if found
+  if (legacyBackups.length > 0) {
+    if (manifests.length > 0) {
+      console.log("\nLegacy tar backups:")
+      console.log("─".repeat(70))
+    } else {
+      console.log(
+        `\nHistory for project "${cfg.project}" (${legacyBackups.length} legacy backups):`,
+      )
+      console.log("─".repeat(70))
+    }
+    for (const b of legacyBackups) {
       const size = formatSize(b.size)
       const keyParts = b.key.split("/")
       const filename = keyParts[keyParts.length - 1] ?? b.key
@@ -114,9 +118,11 @@ export async function cmdLog(args: string[]): Promise<void> {
       console.log(`  Size:   ${size}`)
       console.log("─".repeat(70))
     }
-  } catch (e) {
-    s.stop("Failed to retrieve history.")
-    console.error(e instanceof Error ? e.message : String(e))
-    process.exit(1)
+  }
+
+  if (manifests.length === 0 && legacyBackups.length === 0) {
+    console.log(
+      `No backups found for project "${cfg.project}" under prefix "${r2Prefix}".`,
+    )
   }
 }

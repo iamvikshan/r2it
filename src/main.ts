@@ -48,7 +48,7 @@ PUSH/PULL FLAGS
   process.exit(status)
 }
 
-type CommandRunner = (args: string[]) => Promise<void> | void
+type CommandRunner = (args: string[], verboseFlag?: boolean) => Promise<void> | void
 
 const commandRegistry: Record<string, CommandRunner> = {
   init: async () => {
@@ -78,14 +78,26 @@ const commandRegistry: Record<string, CommandRunner> = {
   restore: async args => {
     await cmdPull(args)
   },
-  log: async args => {
-    await cmdLog(args)
+  log: async (args, verboseFlag) => {
+    // Restore verbose flag if it was set globally
+    const argsWithVerbose = verboseFlag && !args.includes("-v") && !args.includes("--verbose")
+      ? [...args, "--verbose"]
+      : args
+    await cmdLog(argsWithVerbose)
   },
-  history: async args => {
-    await cmdLog(args)
+  history: async (args, verboseFlag) => {
+    // Restore verbose flag if it was set globally
+    const argsWithVerbose = verboseFlag && !args.includes("-v") && !args.includes("--verbose")
+      ? [...args, "--verbose"]
+      : args
+    await cmdLog(argsWithVerbose)
   },
-  list: async args => {
-    await cmdLog(args)
+  list: async (args, verboseFlag) => {
+    // Restore verbose flag if it was set globally
+    const argsWithVerbose = verboseFlag && !args.includes("-v") && !args.includes("--verbose")
+      ? [...args, "--verbose"]
+      : args
+    await cmdLog(argsWithVerbose)
   },
   clone: async args => {
     await cmdClone(args[0])
@@ -108,10 +120,13 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2)
 
   // Handle global flags before command dispatch
-  if (args.includes("--verbose") || args.includes("-v")) {
+  const verboseFlag = args.includes("--verbose") || args.includes("-v")
+  const quietFlag = args.includes("--quiet") || args.includes("-q")
+
+  if (verboseFlag) {
     setLogLevel("debug")
   }
-  if (args.includes("--quiet") || args.includes("-q")) {
+  if (quietFlag) {
     setLogLevel("error")
   }
 
@@ -126,7 +141,7 @@ async function main(): Promise<void> {
 
   const runner = commandRegistry[cmd]
   if (runner) {
-    await runner(filteredArgs.slice(1))
+    await runner(filteredArgs.slice(1), verboseFlag)
   } else {
     console.error(`Unknown command: ${cmd}`)
     help(1)

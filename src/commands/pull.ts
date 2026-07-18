@@ -21,7 +21,7 @@ import { dirname } from "node:path"
  * Returns true if restored from R2, false if already correct locally.
  */
 async function restoreFile(
-  r2Config: ResolvedConfig,
+  r2Config: ResolvedConfig["r2"],
   projectPrefix: string,
   path: string,
   entry: Manifest["entries"][string],
@@ -59,6 +59,13 @@ async function restoreFile(
     if (exists) {
       const localHash = await hashFile(absolutePath)
       if (localHash === entry.hash) {
+        // Apply permissions before returning cached
+        try {
+          const mode = parseInt(entry.mode, 8)
+          chmodSync(absolutePath, mode)
+        } catch {
+          // Permission set may fail on some systems
+        }
         return "cached"
       }
     }
@@ -117,26 +124,51 @@ async function performPull(
   const s = p.spinner()
   s.start("Fetching backup manifest...")
 
-  let manifest: Manifest
+  let manifest: Manifest | null = null
   try {
     if (specificManifest) {
+      // Check if user provided a .tar.gz key explicitly
+      if (specificManifest.endsWith(".tar.gz")) {
+        s.stop("Legacy tar backup specified — not supported in pull. Use clone for tar backups.")
+        p.cancel("Pull only supports manifest-based backups. Specify a .json manifest key or omit --backup.")
+        process.exit(1)
+      }
       manifest = await downloadManifest(cfg.r2, specificManifest)
     } else {
       const latest = await getLatestManifest(cfg.r2, r2Prefix)
-      if (!latest) {
-        s.stop("No backups found.")
-        p.cancel(`No backups found for project '${cfg.project}' under prefix ${r2Prefix}.`)
-        process.exit(1)
+      if (latest) {
+        manifest = latest.manifest
       }
-      manifest = latest.manifest
     }
-    result.totalFiles = Object.keys(manifest.entries).length
-    s.stop(`Manifest loaded: ${result.totalFiles} file(s)`)
   } catch (e) {
     s.stop("Failed to fetch manifest.")
     logError(e instanceof Error ? e.message : String(e), "pull")
     process.exit(1)
   }
+
+  // If no manifest found, check for legacy tar backups
+  if (!manifest) {
+    s.stop("No manifest backups found.")
+    try {
+      const { listObjects } = await import("../utils/r2")
+      const all = await listObjects(cfg.r2, r2Prefix)
+      const tarBackups = all.filter(a => a.key.endsWith(".tar.gz"))
+      if (tarBackups.length > 0) {
+        p.cancel(
+          `No manifest-based backups found, but ${tarBackups.length} legacy tar backup(s) exist. ` +
+          `Use 'r2git clone ${cfg.project}' to restore from legacy tar backups.`
+        )
+      } else {
+        p.cancel(`No backups found for project '${cfg.project}' under prefix ${r2Prefix}.`)
+      }
+    } catch {
+      p.cancel(`No backups found for project '${cfg.project}' under prefix ${r2Prefix}.`)
+    }
+    process.exit(1)
+  }
+
+  result.totalFiles = Object.keys(manifest.entries).length
+  s.stop(`Manifest loaded: ${result.totalFiles} file(s)`)
 
   // Step 2: Restore files
   const ctx = buildPathContext(cfg.project)
@@ -229,6 +261,12 @@ export async function cmdPull(args: string[]): Promise<void> {
 
   if (result.errors.length > 0) {
     warn(`${result.errors.length} error(s) occurred during pull`, "pull")
+    console.log("")
+    console.log(
+      `\x1b[31m✖ Pull incomplete:\x1b[0m ${result.restoredFiles} restored, ${result.cachedFiles} cached, ${result.errors.length} failed`,
+    )
+    console.log("")
+    process.exit(1)
   }
 
   console.log("")

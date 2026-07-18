@@ -24,7 +24,7 @@ async function restoreFromManifest(
   manifest: Manifest,
   r2Prefix: string,
   projectName: string,
-): Promise<void> {
+): Promise<{ restored: number; errors: number }> {
   const entries = Object.entries(manifest.entries)
   const s = p.spinner()
   s.start(`Restoring ${entries.length} file(s) from manifest...`)
@@ -70,6 +70,7 @@ async function restoreFromManifest(
   }
 
   s.stop(`Restored ${restored} file(s), ${errors} error(s)`)
+  return { restored, errors }
 }
 
 /**
@@ -140,7 +141,10 @@ export async function cmdClone(projectName: string | undefined): Promise<void> {
     name = typed as string
   }
 
-  const r2Prefix = projectR2Prefix(name)
+  // Use configured backup prefix (if any) from global config or default
+  const projectCfg = global.projects[name]
+  const pkgPrefix = projectCfg?.backup?.prefix
+  const r2Prefix = projectR2Prefix(name, pkgPrefix)
 
   // Try manifest-based restore first (new format)
   const s = p.spinner()
@@ -150,14 +154,21 @@ export async function cmdClone(projectName: string | undefined): Promise<void> {
     const latest = await getLatestManifest(global.r2, r2Prefix)
     if (latest) {
       s.stop(`Found manifest: ${latest.key}`)
-      await restoreFromManifest(global, latest.manifest, r2Prefix, name)
+      const result = await restoreFromManifest(global, latest.manifest, r2Prefix, name)
+
+      if (result.errors > 0) {
+        warn(`${result.errors} file(s) failed to restore`, "clone")
+        p.cancel(`Clone incomplete: ${result.restored} restored, ${result.errors} failed.`)
+        process.exit(1)
+      }
 
       // Populate paths from manifest entries so subsequent status/push track everything
       const restoredPaths = Object.keys(latest.manifest.entries)
       const newLocal: LocalConfig = {
         project: name,
         backup: {
-          retention: 5,
+          retention: projectCfg?.backup?.retention ?? 5,
+          ...(pkgPrefix !== undefined && { prefix: pkgPrefix }),
           paths: restoredPaths.length > 0 ? restoredPaths : [...DEFAULT_PATHS],
         },
       }
@@ -188,7 +199,11 @@ export async function cmdClone(projectName: string | undefined): Promise<void> {
       await restoreFromTar(global, latest.key)
       await writeLocalConfig({
         project: name,
-        backup: { retention: 5, paths: [...DEFAULT_PATHS] },
+        backup: {
+          retention: projectCfg?.backup?.retention ?? 5,
+          ...(pkgPrefix !== undefined && { prefix: pkgPrefix }),
+          paths: [...DEFAULT_PATHS]
+        },
       })
       p.outro(
         "Local .r2gitconfig created. Ready to run r2git status and r2git push (^_<) ~*",

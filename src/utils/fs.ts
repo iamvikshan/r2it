@@ -17,6 +17,21 @@ export type PathContext = {
 }
 
 /**
+ * Check if a path is exactly baseDir or a descendant of it,
+ * preventing sibling directory false matches (e.g. "/home/user" vs "/home/user2").
+ * Returns true only if path === baseDir or path starts with baseDir + separator.
+ */
+export function isPathUnderBase(path: string, baseDir: string): boolean {
+  if (path === baseDir) return true
+  // Normalize to avoid trailing slashes
+  const normalizedBase = baseDir.endsWith("/") ? baseDir.slice(0, -1) : baseDir
+  const normalizedPath = path.endsWith("/") ? path.slice(0, -1) : path
+  if (normalizedPath === normalizedBase) return true
+  // Check for path separator boundary
+  return normalizedPath.startsWith(normalizedBase + "/")
+}
+
+/**
  * Resolve a path variable string to an absolute path.
  *
  * Supported variables:
@@ -67,7 +82,7 @@ export function buildPathContext(project?: string): PathContext {
   return {
     cwd: process.cwd(),
     home: homeDir(),
-    project,
+    ...(project !== undefined && { project }),
   }
 }
 

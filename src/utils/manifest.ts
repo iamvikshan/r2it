@@ -1,7 +1,8 @@
 import type { Manifest, ManifestEntry, ObjectType } from "./store-types"
 import { hashFile, hashBuffer } from "./hash"
-import { checkPathExists, isSymlink, getFileSize, type PathContext } from "./fs"
+import { checkPathExists, isSymlink, isDirectory, getFileSize, type PathContext } from "./fs"
 import { lstatSync, readlinkSync } from "node:fs"
+import { Glob } from "bun"
 
 /**
  * Get file mode as octal string (e.g. "0644").
@@ -38,9 +39,9 @@ export async function tarSymlink(filePath: string): Promise<Uint8Array> {
     "tar",
     "-cf",
     "-",
-    "--transform=s,^,symlink,",
     "-C",
     "/",
+    "--",
     filePath.slice(1), // strip leading /
   ])
   if (!proc.success) {
@@ -102,12 +103,45 @@ export async function buildManifest(
   paths: Array<{ original: string; absolute: string }>,
   project: string,
   parentKey: string | null,
-): Promise<{ manifest: Manifest; objectDataMap: Map<string, Uint8Array> }> {
+): Promise<{
+  manifest: Manifest
+  objectDataMap: Map<string, Uint8Array>
+  errors: Array<{ path: string; reason: string }>
+}> {
   const entries: Record<string, ManifestEntry> = {}
   const objectDataMap = new Map<string, Uint8Array>()
   const errors: Array<{ path: string; reason: string }> = []
 
+  // Expand directories into individual files
+  const expandedPaths: Array<{ original: string; absolute: string }> = []
   for (const p of paths) {
+    const isDir = await isDirectory(p.absolute)
+    if (isDir) {
+      // Recursively expand directory into individual file entries
+      try {
+        const glob = new Glob("**/*")
+        for (const entry of glob.scanSync({
+          cwd: p.absolute,
+          absolute: true,
+          onlyFiles: false, // Include symlinks
+          dot: true,
+        })) {
+          const relPath = entry.slice(p.absolute.length).replace(/^\//, "")
+          const originalPath = `${p.original}/${relPath}`
+          expandedPaths.push({ original: originalPath, absolute: entry })
+        }
+      } catch (e) {
+        errors.push({
+          path: p.original,
+          reason: `Failed to expand directory: ${e instanceof Error ? e.message : String(e)}`,
+        })
+      }
+    } else {
+      expandedPaths.push(p)
+    }
+  }
+
+  for (const p of expandedPaths) {
     try {
       const result = await buildEntry(p.absolute)
       if (!result) {
@@ -126,15 +160,21 @@ export async function buildManifest(
     }
   }
 
+  // Generate unique timestamp with milliseconds and random suffix
+  const now = new Date()
+  const isoWithMs = now.toISOString() // Keep full precision including milliseconds
+  const randomSuffix = Math.random().toString(36).substring(2, 8)
+  const uniqueTimestamp = `${isoWithMs.replace(/:/g, "-").replace(/\./g, "-")}-${randomSuffix}`
+
   const manifest: Manifest = {
     version: 1,
-    timestamp: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+    timestamp: uniqueTimestamp,
     project,
     parent: parentKey,
     entries,
   }
 
-  return { manifest, objectDataMap }
+  return { manifest, objectDataMap, errors }
 }
 
 /**
@@ -158,7 +198,11 @@ export function diffManifests(
     const remoteEntry = remote.entries[path]
     if (!remoteEntry) {
       added.push(path)
-    } else if (remoteEntry.hash !== localEntry.hash) {
+    } else if (
+      remoteEntry.hash !== localEntry.hash ||
+      remoteEntry.mode !== localEntry.mode ||
+      remoteEntry.type !== localEntry.type
+    ) {
       changed.push(path)
     } else {
       unchanged.push(path)

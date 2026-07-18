@@ -73,8 +73,11 @@ async function printLocalStatus(
   let localManifest: Manifest | null = null
   if (validPaths.length > 0) {
     try {
-      const { manifest } = await buildManifest(validPaths, cfg.project, null)
-      localManifest = manifest
+      const { manifest, errors } = await buildManifest(validPaths, cfg.project, null)
+      if (errors.length === 0) {
+        localManifest = manifest
+      }
+      // If there are errors, skip diff
     } catch {
       // If hashing fails, skip diff
     }
@@ -131,9 +134,20 @@ async function printRemoteStatus(
           console.log(`  \x1b[33m~ ${diff.changed.length} changed file(s)\x1b[0m`)
         if (diff.removed.length > 0)
           console.log(`  \x1b[36m- ${diff.removed.length} removed from local\x1b[0m`)
-        console.log(
-          "\n  Run 'r2git diff' for details or 'r2git push' to backup.\n",
-        )
+
+        // Provide guidance based on change type
+        const hasLocalAdditionsOrChanges = diff.added.length > 0 || diff.changed.length > 0
+        const hasOnlyRemovals = diff.removed.length > 0 && !hasLocalAdditionsOrChanges
+
+        if (hasOnlyRemovals) {
+          console.log(
+            "\n  Remote has files not present locally. Run 'r2git diff' to inspect or 'r2git pull' to restore.\n",
+          )
+        } else {
+          console.log(
+            "\n  Run 'r2git diff' for details, 'r2git push' to backup, or 'r2git pull' to restore.\n",
+          )
+        }
       } else {
         console.log(
           `\x1b[32m✔ Workspace is up-to-date with remote backup.\x1b[0m\n`,

@@ -61,6 +61,9 @@ export type PathResult = {
 }
 
 export function printPathResult(r: PathResult): void {
+  // Respect quiet mode - only show errors
+  if (!shouldLog("info") && r.status !== "error") return
+
   switch (r.status) {
     case "ok": {
       const size = r.size !== undefined ? ` (${formatSize(r.size)})` : ""
@@ -77,6 +80,9 @@ export function printPathResult(r: PathResult): void {
 }
 
 export function printPathSummary(results: PathResult[]): void {
+  // Respect quiet mode - only show summary if logging is enabled
+  if (!shouldLog("info")) return
+
   const ok = results.filter(r => r.status === "ok")
   const skipped = results.filter(r => r.status === "skipped")
   const errors = results.filter(r => r.status === "error")

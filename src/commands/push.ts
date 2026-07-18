@@ -20,6 +20,7 @@ import {
   formatSize,
   type PathResult,
 } from "../utils/log"
+import { hashBuffer } from "../utils/hash"
 import type { ResolvedConfig } from "../utils/types"
 import type { Manifest, PushResult } from "../utils/store-types"
 
@@ -64,7 +65,7 @@ async function buildLocalManifest(cfg: ResolvedConfig): Promise<{
       pathResults.push({
         path: r.original,
         status: "ok",
-        size: size ?? undefined,
+        ...(size !== null && { size }),
       })
       validPaths.push({ original: r.original, absolute: r.absolute })
     } catch (e) {
@@ -77,11 +78,20 @@ async function buildLocalManifest(cfg: ResolvedConfig): Promise<{
   }
 
   // Build manifest from valid paths
-  const { manifest, objectDataMap } = await buildManifest(
+  const { manifest, objectDataMap, errors: buildErrors } = await buildManifest(
     validPaths,
     cfg.project,
     null, // parent set later
   )
+
+  // Add build errors to pathResults
+  for (const err of buildErrors) {
+    pathResults.push({
+      path: err.path,
+      status: "error",
+      reason: err.reason,
+    })
+  }
 
   return { manifest, objectDataMap, pathResults }
 }
@@ -123,6 +133,14 @@ async function performPush(
   }
   printPathSummary(pathResults)
 
+  // Check for errors during manifest building
+  const buildErrors = pathResults.filter(r => r.status === "error")
+  if (buildErrors.length > 0) {
+    logError(`${buildErrors.length} file(s) failed during hashing`, "push")
+    result.errors = buildErrors.map(r => ({ path: r.path, reason: r.reason ?? "unknown error" }))
+    return result
+  }
+
   if (result.totalFiles === 0) {
     return result
   }
@@ -153,6 +171,7 @@ async function performPush(
 
   // Step 3: Diff to find what needs uploading
   let objectsToUpload: Array<{ hash: string; data?: Uint8Array }> = []
+  let manifestNeedsUpdate = false
 
   if (remoteManifest) {
     const diff = diffManifests(manifest, remoteManifest)
@@ -167,22 +186,27 @@ async function performPush(
     const neededHashes = new Set(changed.map(p => manifest.entries[p]!.hash))
     for (const hash of neededHashes) {
       const data = objectDataMap.get(hash)
-      objectsToUpload.push({ hash, data })
+      objectsToUpload.push({ hash, ...(data !== undefined && { data }) })
     }
+
+    // Manifest needs update if there are added, changed, or removed entries
+    manifestNeedsUpdate = diff.added.length > 0 || diff.changed.length > 0 || diff.removed.length > 0
   } else {
     // Full backup — all objects needed
     const seen = new Set<string>()
     for (const entry of Object.values(manifest.entries)) {
       if (!seen.has(entry.hash)) {
         seen.add(entry.hash)
-        objectsToUpload.push({ hash: entry.hash, data: objectDataMap.get(entry.hash) })
+        const data = objectDataMap.get(entry.hash)
+        objectsToUpload.push({ hash: entry.hash, ...(data !== undefined && { data }) })
       }
     }
+    manifestNeedsUpdate = true
   }
 
   result.newObjects = objectsToUpload.length
 
-  if (result.newObjects === 0) {
+  if (result.newObjects === 0 && !manifestNeedsUpdate) {
     info("No changes detected — nothing to upload", "push")
     return result
   }
@@ -238,6 +262,12 @@ async function performPush(
     `Uploaded ${uploaded} object(s), ${result.skippedObjects} already on R2, ${formatSize(result.uploadedBytes)} transferred`,
   )
 
+  // Check for upload errors before proceeding to manifest upload
+  if (result.errors.length > 0) {
+    logError(`${result.errors.length} object(s) failed to upload`, "push")
+    return result
+  }
+
   // Step 5: Upload manifest
   const s4 = p.spinner()
   s4.start("Uploading manifest...")
@@ -270,8 +300,20 @@ export async function cmdPush(args: string[]): Promise<void> {
   }
 
   const keepIdx = args.indexOf("--keep")
-  const retention =
-    keepIdx !== -1 ? Number(args[keepIdx + 1]) : cfg.backup.retention
+  let retention = cfg.backup.retention
+  if (keepIdx !== -1) {
+    const keepValue = args[keepIdx + 1]
+    if (!keepValue || keepValue.trim() === "") {
+      p.cancel("Error: --keep requires a numeric value")
+      process.exit(1)
+    }
+    const parsed = Number(keepValue)
+    if (isNaN(parsed) || !Number.isInteger(parsed) || parsed < 1) {
+      p.cancel("Error: --keep must be a positive integer (minimum 1)")
+      process.exit(1)
+    }
+    retention = parsed
+  }
   const prefixIdx = args.indexOf("--prefix")
   const pkgPrefix =
     prefixIdx !== -1

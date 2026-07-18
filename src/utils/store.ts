@@ -1,5 +1,5 @@
 import { uploadObject, downloadObject, listObjects, headObject, deleteObject } from "./r2"
-import { objectKey } from "./hash"
+import { objectKey, hashBuffer } from "./hash"
 import type { R2Config } from "./types"
 import type { Manifest } from "./store-types"
 import { serializeManifest, deserializeManifest } from "./manifest"
@@ -29,6 +29,14 @@ export async function uploadObjectIfMissing(
 ): Promise<boolean> {
   const key = objectKey(hash, projectPrefix)
 
+  // Verify content-addressed integrity: hash must match data
+  const actualHash = hashBuffer(data)
+  if (actualHash !== hash) {
+    throw new Error(
+      `Content-address verification failed for upload: expected ${hash}, got ${actualHash}`
+    )
+  }
+
   // Check existence first (avoid unnecessary uploads)
   const exists = await headObject(r2, key)
   if (exists) {
@@ -50,7 +58,17 @@ export async function downloadObjectByHash(
   projectPrefix: string,
 ): Promise<ArrayBuffer> {
   const key = objectKey(hash, projectPrefix)
-  return downloadObject(r2, key)
+  const data = await downloadObject(r2, key)
+
+  // Verify content-addressed integrity: downloaded data must match expected hash
+  const actualHash = hashBuffer(data)
+  if (actualHash !== hash) {
+    throw new Error(
+      `Content-address verification failed for download: expected ${hash}, got ${actualHash}`
+    )
+  }
+
+  return data
 }
 
 /**
@@ -125,8 +143,26 @@ export async function enforceManifestRetention(
   if (manifests.length <= retention) return 0
 
   const stale = manifests.slice(retention)
+  const retained = manifests.slice(0, retention)
   let deleted = 0
 
+  // Collect hashes referenced by retained manifests
+  const referencedHashes = new Set<string>()
+  for (const m of retained) {
+    try {
+      const manifest = await downloadManifest(r2, m.key)
+      for (const entry of Object.values(manifest.entries)) {
+        referencedHashes.add(entry.hash)
+      }
+    } catch (e) {
+      debug(
+        `Failed to read manifest ${m.key} for GC: ${e instanceof Error ? e.message : String(e)}`,
+        "retention",
+      )
+    }
+  }
+
+  // Delete stale manifests
   for (const m of stale) {
     try {
       await deleteObject(r2, m.key)
@@ -140,9 +176,40 @@ export async function enforceManifestRetention(
     }
   }
 
-  // Note: We don't delete orphaned objects here because they may be shared
-  // with newer manifests (content-addressed). A garbage collection pass
-  // could be added later.
+  // Garbage collect unreferenced objects
+  try {
+    const objectsPrefix = `${projectPrefix}objects/`
+    const allObjects = await listObjects(r2, objectsPrefix)
+    let gcDeleted = 0
+
+    for (const obj of allObjects) {
+      // Extract hash from object key (format: objects/ab/cdef...)
+      const parts = obj.key.split("/")
+      const hash = parts.length >= 3 ? (parts[parts.length - 2] ?? "") + (parts[parts.length - 1] ?? "") : ""
+
+      if (hash && !referencedHashes.has(hash)) {
+        try {
+          await deleteObject(r2, obj.key)
+          gcDeleted++
+          debug(`GC deleted unreferenced object: ${hash.slice(0, 12)}…`, "retention")
+        } catch (e) {
+          debug(
+            `Failed to delete object ${obj.key}: ${e instanceof Error ? e.message : String(e)}`,
+            "retention",
+          )
+        }
+      }
+    }
+
+    if (gcDeleted > 0) {
+      info(`Garbage collected ${gcDeleted} unreferenced object(s)`, "retention")
+    }
+  } catch (e) {
+    debug(
+      `Failed to list objects for GC: ${e instanceof Error ? e.message : String(e)}`,
+      "retention",
+    )
+  }
 
   return deleted
 }

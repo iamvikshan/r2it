@@ -4,7 +4,7 @@ import {
   writeLocalConfig,
   LOCAL_CONFIG_FILENAME,
 } from "../utils/config"
-import { resolvePath, buildPathContext, type PathContext } from "../utils/fs"
+import { resolvePath, buildPathContext, isPathUnderBase } from "../utils/fs"
 import { info } from "../utils/log"
 
 export async function cmdAdd(args: string[]): Promise<void> {
@@ -38,11 +38,7 @@ export async function cmdAdd(args: string[]): Promise<void> {
       .filter(Boolean)
   }
 
-  const ctx: PathContext = {
-    cwd: process.cwd(),
-    home: process.env.HOME ?? "/root",
-    project: local.project,
-  }
+  const ctx = buildPathContext(local.project)
 
   const currentPaths = new Set(local.backup.paths)
   let addedCount = 0
@@ -52,10 +48,10 @@ export async function cmdAdd(args: string[]): Promise<void> {
     const absPath = resolvePath(path, ctx)
     let resolved = path
 
-    if (absPath.startsWith(ctx.cwd)) {
+    if (isPathUnderBase(absPath, ctx.cwd)) {
       const rel = absPath.slice(ctx.cwd.length).replace(/^\//, "")
       resolved = `{cwd}/${rel}`
-    } else if (absPath.startsWith(ctx.home)) {
+    } else if (isPathUnderBase(absPath, ctx.home)) {
       const rel = absPath.slice(ctx.home.length).replace(/^\//, "")
       resolved = `{home}/${rel}`
     }
