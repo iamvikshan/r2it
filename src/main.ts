@@ -8,6 +8,7 @@ import { cmdLog } from "./commands/log"
 import { cmdClone } from "./commands/clone"
 import { cmdAuth } from "./commands/auth"
 import { cmdProject } from "./commands/project"
+import { cmdDiff } from "./commands/diff"
 import { setLogLevel } from "./utils/log"
 
 function help(status: number): never {
@@ -30,6 +31,7 @@ CORE COMMANDS
 ADDITIONAL COMMANDS
   auth <login|status|doppler> Manage credentials (supports manual R2 keys, Doppler CLI oauth, or Doppler web tokens)
   project <list|switch>     Manage active projects and settings
+  diff                      Compare local files against latest remote backup
 
 GLOBAL FLAGS
   -h, --help                Show help for r2git or a command
@@ -93,6 +95,12 @@ const commandRegistry: Record<string, CommandRunner> = {
   },
   project: async args => {
     await cmdProject(args)
+  },
+  diff: async () => {
+    await cmdDiff()
+  },
+  compare: async () => {
+    await cmdDiff()
   },
 }
 

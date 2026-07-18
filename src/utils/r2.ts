@@ -65,6 +65,13 @@ export async function deleteObject(cfg: R2Config, key: string): Promise<void> {
   }
 }
 
+export async function headObject(cfg: R2Config, key: string): Promise<boolean> {
+  const client = createClient(cfg)
+  const url = objectUrl(cfg, key)
+  const res = await client.fetch(url, { method: "HEAD" })
+  return res.ok
+}
+
 function parseContents(xml: string): AssetMeta[] {
   const results: AssetMeta[] = []
   for (const block of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) {

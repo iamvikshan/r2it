@@ -1,18 +1,16 @@
 import * as p from "@clack/prompts"
-import {
-  resolveActiveProjectConfig,
-  projectR2Prefix,
-} from "../utils/config"
-import { uploadObject, listObjects, deleteObject } from "../utils/r2"
+import { resolveActiveProjectConfig, projectR2Prefix } from "../utils/config"
 import { getCurrentDirBasename } from "../utils/git"
+import { resolvePaths, buildPathContext } from "../utils/fs"
+import { readFile } from "node:fs/promises"
+import { buildManifest, diffManifests } from "../utils/manifest"
 import {
-  checkPathExists,
-  resolvePaths,
-  buildPathContext,
-  getFileSize,
-  isDirectory,
-  isSymlink,
-} from "../utils/fs"
+  uploadObjectIfMissing,
+  uploadManifest,
+  getLatestManifest,
+  enforceManifestRetention,
+} from "../utils/store"
+import { objectKey } from "../utils/hash"
 import {
   info,
   warn,
@@ -22,9 +20,8 @@ import {
   formatSize,
   type PathResult,
 } from "../utils/log"
-import type { ResolvedConfig, R2Config } from "../utils/types"
-
-const TMP_TAR = "/tmp/r2git-backup.tar.gz"
+import type { ResolvedConfig } from "../utils/types"
+import type { Manifest, PushResult } from "../utils/store-types"
 
 function utcStamp(): string {
   const n = new Date()
@@ -37,51 +34,41 @@ function utcStamp(): string {
 }
 
 /**
- * Validate and resolve all tracked paths.
- * Returns detailed results for each path — exists, missing, error, etc.
+ * Validate paths and build local manifest.
  */
-async function validatePaths(
-  cfg: ResolvedConfig,
-): Promise<{ results: PathResult[]; existing: string[] }> {
+async function buildLocalManifest(cfg: ResolvedConfig): Promise<{
+  manifest: Manifest
+  objectDataMap: Map<string, Uint8Array>
+  pathResults: PathResult[]
+}> {
   const ctx = buildPathContext(cfg.project)
   const resolved = resolvePaths(cfg.backup.paths, ctx)
-  const results: PathResult[] = []
-  const existing: string[] = []
+
+  // Validate paths first
+  const pathResults: PathResult[] = []
+  const validPaths: Array<{ original: string; absolute: string }> = []
 
   for (const r of resolved) {
     try {
+      const { checkPathExists, getFileSize } = await import("../utils/fs")
       const exists = await checkPathExists(r.absolute)
       if (!exists) {
-        results.push({
+        pathResults.push({
           path: r.original,
           status: "skipped",
           reason: "file not found",
         })
         continue
       }
-
-      // Check if it's a directory — tar handles these fine
-      const dir = await isDirectory(r.absolute)
-      if (dir) {
-        const size = await getFileSize(r.absolute)
-        results.push({
-          path: r.original,
-          status: "ok",
-          size: size ?? 0,
-        })
-        existing.push(r.relative)
-        continue
-      }
-
       const size = await getFileSize(r.absolute)
-      results.push({
+      pathResults.push({
         path: r.original,
         status: "ok",
         size: size ?? undefined,
       })
-      existing.push(r.relative)
+      validPaths.push({ original: r.original, absolute: r.absolute })
     } catch (e) {
-      results.push({
+      pathResults.push({
         path: r.original,
         status: "error",
         reason: e instanceof Error ? e.message : String(e),
@@ -89,102 +76,187 @@ async function validatePaths(
     }
   }
 
-  return { results, existing }
+  // Build manifest from valid paths
+  const { manifest, objectDataMap } = await buildManifest(
+    validPaths,
+    cfg.project,
+    null, // parent set later
+  )
+
+  return { manifest, objectDataMap, pathResults }
 }
 
-function tarPaths(paths: string[], label: string): boolean {
-  info(`Archiving ${paths.length} path(s)...`, "tar")
-  const proc = Bun.spawnSync([
-    "tar",
-    "-czf",
-    TMP_TAR,
-    "--ignore-failed-read",
-    "-C",
-    "/",
-    ...paths,
-  ])
-  if (!proc.success) {
-    const stderr = proc.stderr.toString().trim()
-    logError(`tar exited with code ${proc.exitCode}`, "tar")
-    if (stderr) {
-      for (const line of stderr.split("\n").slice(0, 10)) {
-        logError(`  ${line}`, "tar")
-      }
-      if (stderr.split("\n").length > 10) {
-        logError(`  ... (${stderr.split("\n").length - 10} more lines)`, "tar")
-      }
-    }
-    return false
-  }
-  return true
-}
-
-async function enforceRetention(
-  r2: R2Config,
-  r2Prefix: string,
-  retention: number,
-): Promise<number> {
-  try {
-    const all = await listObjects(r2, r2Prefix)
-    const backups = all
-      .filter(a => a.key.startsWith(r2Prefix) && a.key.endsWith(".tar.gz"))
-      .sort(
-        (a, b) =>
-          new Date(b.lastModified).getTime() -
-          new Date(a.lastModified).getTime(),
-      )
-    if (backups.length > retention) {
-      const stale = backups.slice(retention)
-      for (const a of stale) {
-        await deleteObject(r2, a.key)
-        info(`Deleted old backup: ${a.key}`, "retention")
-      }
-      return stale.length
-    }
-    return 0
-  } catch (e) {
-    warn(
-      `Retention cleanup failed: ${e instanceof Error ? e.message : String(e)}`,
-      "retention",
-    )
-    return 0
-  }
-}
-
+/**
+ * Perform the incremental push:
+ * 1. Build local manifest (hash all files)
+ * 2. Fetch latest remote manifest
+ * 3. Diff: find new/changed objects
+ * 4. Upload only new objects
+ * 5. Upload manifest
+ */
 async function performPush(
   cfg: ResolvedConfig,
-  key: string,
-  existingPaths: string[],
-  retention: number,
   r2Prefix: string,
-): Promise<void> {
+  retention: number,
+): Promise<PushResult> {
+  const result: PushResult = {
+    manifestKey: "",
+    totalFiles: 0,
+    newObjects: 0,
+    skippedObjects: 0,
+    uploadedBytes: 0,
+    errors: [],
+  }
+
+  // Step 1: Build local manifest
   const s = p.spinner()
-  s.start("Archiving files and uploading to R2...")
+  s.start("Hashing tracked files...")
 
-  if (!tarPaths(existingPaths, `backup for ${cfg.project}`)) {
-    s.stop("Archiving failed.")
-    process.exit(1)
+  const { manifest, objectDataMap, pathResults } = await buildLocalManifest(cfg)
+  result.totalFiles = Object.keys(manifest.entries).length
+
+  s.stop(`Hashed ${result.totalFiles} file(s)`)
+
+  // Show per-path results
+  for (const r of pathResults) {
+    printPathResult(r)
+  }
+  printPathSummary(pathResults)
+
+  if (result.totalFiles === 0) {
+    return result
   }
 
+  // Step 2: Fetch latest remote manifest for diffing
+  const s2 = p.spinner()
+  s2.start("Checking remote state...")
+
+  let parentKey: string | null = null
+  let remoteManifest: Manifest | null = null
   try {
-    const file = Bun.file(TMP_TAR)
-    const size = file.size
-    s.message(`Uploading ${formatSize(size)} to R2...`)
-    const buf = await file.arrayBuffer()
-    await uploadObject(cfg.r2, key, buf, "application/gzip")
-    s.stop(`Backup uploaded: ${key} (${formatSize(size)})`)
+    const latest = await getLatestManifest(cfg.r2, r2Prefix)
+    if (latest) {
+      remoteManifest = latest.manifest
+      parentKey = latest.key
+      manifest.parent = parentKey
+      s2.stop(`Found remote manifest (${Object.keys(latest.manifest.entries).length} entries)`)
+    } else {
+      s2.stop("No previous backup found — this will be a full backup")
+    }
   } catch (e) {
-    s.stop("Upload failed.")
-    logError(e instanceof Error ? e.message : String(e), "upload")
-    Bun.spawnSync(["rm", "-f", TMP_TAR])
-    process.exit(1)
+    s2.stop("Could not fetch remote manifest — proceeding with full backup")
+    warn(
+      `Remote manifest fetch failed: ${e instanceof Error ? e.message : String(e)}`,
+      "push",
+    )
   }
-  Bun.spawnSync(["rm", "-f", TMP_TAR])
 
-  const cleaned = await enforceRetention(cfg.r2, r2Prefix, retention)
-  if (cleaned > 0) {
-    info(`Cleaned up ${cleaned} old backup(s)`, "retention")
+  // Step 3: Diff to find what needs uploading
+  let objectsToUpload: Array<{ hash: string; data?: Uint8Array }> = []
+
+  if (remoteManifest) {
+    const diff = diffManifests(manifest, remoteManifest)
+    const changed = [...diff.added, ...diff.changed]
+
+    info(
+      `Changes: ${diff.added.length} added, ${diff.changed.length} changed, ${diff.removed.length} removed, ${diff.unchanged.length} unchanged`,
+      "diff",
+    )
+
+    // Collect hashes that need uploading
+    const neededHashes = new Set(changed.map(p => manifest.entries[p]!.hash))
+    for (const hash of neededHashes) {
+      const data = objectDataMap.get(hash)
+      objectsToUpload.push({ hash, data })
+    }
+  } else {
+    // Full backup — all objects needed
+    const seen = new Set<string>()
+    for (const entry of Object.values(manifest.entries)) {
+      if (!seen.has(entry.hash)) {
+        seen.add(entry.hash)
+        objectsToUpload.push({ hash: entry.hash, data: objectDataMap.get(entry.hash) })
+      }
+    }
   }
+
+  result.newObjects = objectsToUpload.length
+
+  if (result.newObjects === 0) {
+    info("No changes detected — nothing to upload", "push")
+    return result
+  }
+
+  // Step 4: Upload new objects
+  const s3 = p.spinner()
+  s3.start(`Uploading ${result.newObjects} object(s)...`)
+
+  let uploaded = 0
+  for (const obj of objectsToUpload) {
+    try {
+      let data = obj.data
+      if (!data) {
+        // Regular file — read from disk
+        // Find the first entry with this hash to get the file path
+        const entryPath = Object.entries(manifest.entries).find(
+          ([, e]) => e.hash === obj.hash,
+        )?.[0]
+        if (!entryPath) continue
+
+        const ctx = buildPathContext(cfg.project)
+        const { resolvePath } = await import("../utils/fs")
+        const absPath = resolvePath(entryPath, ctx)
+        data = await readFile(absPath)
+      }
+
+      const wasUploaded = await uploadObjectIfMissing(
+        cfg.r2,
+        obj.hash,
+        data,
+        r2Prefix,
+      )
+      if (wasUploaded) {
+        result.uploadedBytes += data.length
+        uploaded++
+        s3.message(`Uploading objects... (${uploaded}/${result.newObjects}, ${formatSize(result.uploadedBytes)})`)
+      } else {
+        result.skippedObjects++
+      }
+    } catch (e) {
+      result.errors.push({
+        path: obj.hash.slice(0, 12),
+        reason: e instanceof Error ? e.message : String(e),
+      })
+      logError(
+        `Failed to upload object ${obj.hash.slice(0, 12)}…: ${e instanceof Error ? e.message : String(e)}`,
+        "upload",
+      )
+    }
+  }
+
+  s3.stop(
+    `Uploaded ${uploaded} object(s), ${result.skippedObjects} already on R2, ${formatSize(result.uploadedBytes)} transferred`,
+  )
+
+  // Step 5: Upload manifest
+  const s4 = p.spinner()
+  s4.start("Uploading manifest...")
+  try {
+    result.manifestKey = await uploadManifest(cfg.r2, manifest, r2Prefix)
+    s4.stop(`Manifest uploaded: ${result.manifestKey}`)
+  } catch (e) {
+    s4.stop("Manifest upload failed!")
+    logError(e instanceof Error ? e.message : String(e), "manifest")
+    throw e
+  }
+
+  // Step 6: Retention cleanup
+  const cleaned = await enforceManifestRetention(cfg.r2, r2Prefix, retention)
+  if (cleaned > 0) {
+    info(`Cleaned up ${cleaned} old manifest(s)`, "retention")
+  }
+
+  return result
 }
 
 export async function cmdPush(args: string[]): Promise<void> {
@@ -215,41 +287,47 @@ export async function cmdPush(args: string[]): Promise<void> {
   }
 
   const r2Prefix = projectR2Prefix(cfg.project, pkgPrefix)
-  const key = `${r2Prefix}${utcStamp()}.tar.gz`
 
-  // Validate all tracked paths with detailed reporting
   if (!quiet) {
     info(`Project: ${cfg.project}`, "push")
     info(`Tracked paths: ${cfg.backup.paths.length}`, "push")
+    info(`Retention: ${retention} backup(s)`, "push")
     console.log("")
   }
 
-  const { results, existing } = await validatePaths(cfg)
-
-  if (!quiet) {
-    // Show per-path results
-    for (const r of results) {
-      printPathResult(r)
-    }
-    printPathSummary(results)
-  }
-
-  if (existing.length === 0) {
-    p.cancel("Error: No tracked paths exist locally. Nothing to backup.")
-    process.exit(1)
-  }
-
   if (dryRun) {
-    console.log(`[dry-run] Project: ${cfg.project}`)
-    console.log(`[dry-run] Would archive ${existing.length} path(s):`)
-    for (const p of existing) {
-      console.log(`  /${p}`)
+    // For dry-run, just hash and show what would happen
+    const ctx = buildPathContext(cfg.project)
+    const resolved = resolvePaths(cfg.backup.paths, ctx)
+
+    console.log("[dry-run] Project:", cfg.project)
+    console.log("[dry-run] Would hash and check these paths:")
+    for (const r of resolved) {
+      console.log(`  ${r.original} → ${r.absolute}`)
     }
-    console.log(`[dry-run] Would upload to R2 as: ${key}`)
-    console.log(`[dry-run] Would retain ${retention} most recent backups`)
+    console.log(`[dry-run] Would compare against latest manifest in R2`)
+    console.log(`[dry-run] Would upload only changed objects`)
+    console.log(`[dry-run] Would retain ${retention} most recent manifests`)
     console.log("")
     return
   }
 
-  await performPush(cfg, key, existing, retention, r2Prefix)
+  const result = await performPush(cfg, r2Prefix, retention)
+
+  if (result.totalFiles === 0) {
+    p.cancel("No tracked paths exist locally. Nothing to backup.")
+    process.exit(1)
+  }
+
+  if (result.errors.length > 0) {
+    warn(`${result.errors.length} error(s) occurred during push`, "push")
+  }
+
+  console.log("")
+  console.log(
+    `\x1b[32m✔ Push complete:\x1b[0m ${result.totalFiles} files, ` +
+      `${result.newObjects} new objects, ${formatSize(result.uploadedBytes)} uploaded`,
+  )
+  console.log(`  Manifest: ${result.manifestKey}`)
+  console.log("")
 }

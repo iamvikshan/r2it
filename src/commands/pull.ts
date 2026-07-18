@@ -1,99 +1,175 @@
 import * as p from "@clack/prompts"
 import { resolveActiveProjectConfig, projectR2Prefix } from "../utils/config"
-import { downloadObject, listObjects } from "../utils/r2"
 import { getCurrentDirBasename } from "../utils/git"
-import { info, error as logError, formatSize } from "../utils/log"
+import { resolvePath, buildPathContext, checkPathExists } from "../utils/fs"
+import { hashFile, hashBuffer } from "../utils/hash"
+import { downloadObjectByHash, getLatestManifest, listManifests, downloadManifest } from "../utils/store"
+import { tarSymlink } from "../utils/manifest"
+import {
+  info,
+  warn,
+  error as logError,
+  formatSize,
+} from "../utils/log"
 import type { ResolvedConfig } from "../utils/types"
+import type { Manifest, PullResult } from "../utils/store-types"
+import { mkdirSync, writeFileSync, symlinkSync, chmodSync } from "node:fs"
+import { dirname } from "node:path"
 
-const TMP_TAR = "/tmp/r2git-backup.tar.gz"
+/**
+ * Restore a single file from the manifest.
+ * Returns true if restored from R2, false if already correct locally.
+ */
+async function restoreFile(
+  r2Config: ResolvedConfig,
+  projectPrefix: string,
+  path: string,
+  entry: Manifest["entries"][string],
+  ctx: ReturnType<typeof buildPathContext>,
+): Promise<"restored" | "cached" | "error"> {
+  const absolutePath = resolvePath(path, ctx)
 
-async function resolvePullKey(
-  cfg: ResolvedConfig,
-  r2Prefix: string,
-  specificKey: string | null,
-  interactive: boolean,
-): Promise<string> {
-  if (specificKey) return specificKey
-
-  if (interactive) {
-    const all = await listObjects(cfg.r2, r2Prefix)
-    const backups = all
-      .filter(a => a.key.endsWith(".tar.gz"))
-      .sort(
-        (a, b) =>
-          new Date(b.lastModified).getTime() -
-          new Date(a.lastModified).getTime(),
+  if (entry.type === "symlink-tar") {
+    // Download the symlink tar and extract it
+    try {
+      const data = await downloadObjectByHash(r2Config, entry.hash, projectPrefix)
+      // Write tar to temp and extract
+      const tmpTar = `/tmp/r2git-symlink-${entry.hash.slice(0, 8)}.tar`
+      await Bun.write(tmpTar, data)
+      const proc = Bun.spawnSync(["tar", "-xf", tmpTar, "-C", "/"])
+      const { unlinkSync } = await import("node:fs")
+      try { unlinkSync(tmpTar) } catch {}
+      if (!proc.success) {
+        logError(`Failed to extract symlink tar for ${path}`, "pull")
+        return "error"
+      }
+      return "restored"
+    } catch (e) {
+      logError(
+        `Failed to restore symlink ${path}: ${e instanceof Error ? e.message : String(e)}`,
+        "pull",
       )
-
-    if (backups.length === 0) {
-      p.cancel(`No backups found under prefix: ${r2Prefix}`)
-      process.exit(1)
+      return "error"
     }
-
-    const picked = await p.select({
-      message: "Select backup to restore",
-      options: backups.map(b => ({
-        value: b.key,
-        label: `${b.key} (${formatSize(b.size)}, ${b.lastModified})`,
-      })),
-    })
-    if (p.isCancel(picked)) {
-      p.cancel("Cancelled.")
-      process.exit(0)
-    }
-    return picked as string
   }
 
-  const all = await listObjects(cfg.r2, r2Prefix)
-  const latest = all
-    .filter(a => a.key.endsWith(".tar.gz"))
-    .sort(
-      (a, b) =>
-        new Date(b.lastModified).getTime() - new Date(a.lastModified).getTime(),
-    )[0]
+  // Regular file — check if local copy matches
+  try {
+    const exists = await checkPathExists(absolutePath)
+    if (exists) {
+      const localHash = await hashFile(absolutePath)
+      if (localHash === entry.hash) {
+        return "cached"
+      }
+    }
+  } catch {
+    // If we can't hash it, we'll re-download
+  }
 
-  if (!latest) {
-    p.cancel(
-      `No backups found for project '${cfg.project}' under prefix ${r2Prefix}.`,
+  // Download and write
+  try {
+    const data = await downloadObjectByHash(r2Config, entry.hash, projectPrefix)
+
+    // Ensure parent directory exists
+    const dir = dirname(absolutePath)
+    mkdirSync(dir, { recursive: true })
+
+    // Write file
+    writeFileSync(absolutePath, new Uint8Array(data))
+
+    // Set permissions
+    try {
+      const mode = parseInt(entry.mode, 8)
+      chmodSync(absolutePath, mode)
+    } catch {
+      // Permission set may fail on some systems
+    }
+
+    return "restored"
+  } catch (e) {
+    logError(
+      `Failed to restore ${path}: ${e instanceof Error ? e.message : String(e)}`,
+      "pull",
     )
-    process.exit(1)
+    return "error"
   }
-  return latest.key
 }
 
-async function performPull(cfg: ResolvedConfig, key: string): Promise<void> {
-  const s = p.spinner()
-  s.start("Downloading backup from R2...")
+/**
+ * Perform the cache-aware pull:
+ * 1. Fetch latest manifest
+ * 2. For each entry, check if local file matches hash
+ * 3. Download only missing/changed files
+ */
+async function performPull(
+  cfg: ResolvedConfig,
+  r2Prefix: string,
+  specificManifest?: string,
+): Promise<PullResult> {
+  const result: PullResult = {
+    totalFiles: 0,
+    restoredFiles: 0,
+    cachedFiles: 0,
+    errors: [],
+  }
 
+  // Step 1: Fetch manifest
+  const s = p.spinner()
+  s.start("Fetching backup manifest...")
+
+  let manifest: Manifest
   try {
-    const buf = await downloadObject(cfg.r2, key)
-    await Bun.write(TMP_TAR, buf)
-    s.stop(`Download completed: ${formatSize(buf.byteLength)}`)
+    if (specificManifest) {
+      manifest = await downloadManifest(cfg.r2, specificManifest)
+    } else {
+      const latest = await getLatestManifest(cfg.r2, r2Prefix)
+      if (!latest) {
+        s.stop("No backups found.")
+        p.cancel(`No backups found for project '${cfg.project}' under prefix ${r2Prefix}.`)
+        process.exit(1)
+      }
+      manifest = latest.manifest
+    }
+    result.totalFiles = Object.keys(manifest.entries).length
+    s.stop(`Manifest loaded: ${result.totalFiles} file(s)`)
   } catch (e) {
-    s.stop("Download failed.")
-    logError(e instanceof Error ? e.message : String(e), "download")
+    s.stop("Failed to fetch manifest.")
+    logError(e instanceof Error ? e.message : String(e), "pull")
     process.exit(1)
   }
 
-  const extSpinner = p.spinner()
-  extSpinner.start("Extracting backup tarball...")
-  try {
-    const proc = Bun.spawnSync(["tar", "-xzf", TMP_TAR, "-C", "/"])
-    if (!proc.success) {
-      extSpinner.stop("Extraction failed.")
-      const stderr = proc.stderr.toString().trim()
-      if (stderr) {
-        for (const line of stderr.split("\n").slice(0, 10)) {
-          logError(`  ${line}`, "tar")
-        }
-      }
-      Bun.spawnSync(["rm", "-f", TMP_TAR])
-      process.exit(1)
+  // Step 2: Restore files
+  const ctx = buildPathContext(cfg.project)
+  const s2 = p.spinner()
+  s2.start(`Restoring ${result.totalFiles} file(s)...`)
+
+  let processed = 0
+  for (const [path, entry] of Object.entries(manifest.entries)) {
+    processed++
+    const status = await restoreFile(cfg.r2, r2Prefix, path, entry, ctx)
+
+    switch (status) {
+      case "restored":
+        result.restoredFiles++
+        break
+      case "cached":
+        result.cachedFiles++
+        break
+      case "error":
+        result.errors.push({ path, reason: "restore failed" })
+        break
     }
-    extSpinner.stop("Extraction completed.")
-  } finally {
-    Bun.spawnSync(["rm", "-f", TMP_TAR])
+
+    if (processed % 10 === 0 || processed === result.totalFiles) {
+      s2.message(`Restoring files... (${processed}/${result.totalFiles})`)
+    }
   }
+
+  s2.stop(
+    `Restore complete: ${result.restoredFiles} restored, ${result.cachedFiles} already up-to-date`,
+  )
+
+  return result
 }
 
 export async function cmdPull(args: string[]): Promise<void> {
@@ -116,15 +192,48 @@ export async function cmdPull(args: string[]): Promise<void> {
   const pkgPrefix = cfg.backup.prefix
   const r2Prefix = projectR2Prefix(cfg.project, pkgPrefix)
 
-  const key = await resolvePullKey(cfg, r2Prefix, specificKey, interactive)
+  let manifestKey: string | undefined
+
+  if (interactive) {
+    const manifests = await listManifests(cfg.r2, r2Prefix)
+    if (manifests.length === 0) {
+      p.cancel(`No backups found under prefix: ${r2Prefix}`)
+      process.exit(1)
+    }
+
+    const picked = await p.select({
+      message: "Select backup to restore",
+      options: manifests.map(m => ({
+        value: m.key,
+        label: `${m.key} (${formatSize(m.size)}, ${m.lastModified})`,
+      })),
+    })
+    if (p.isCancel(picked)) {
+      p.cancel("Cancelled.")
+      process.exit(0)
+    }
+    manifestKey = picked as string
+  } else if (specificKey) {
+    manifestKey = specificKey
+  }
 
   if (dryRun) {
     console.log(`\n[dry-run] Project: ${cfg.project}`)
-    console.log(`[dry-run] Would download and restore backup: ${key}\n`)
+    console.log(`[dry-run] Would fetch manifest from: ${manifestKey ?? "latest"}`)
+    console.log("[dry-run] Would compare local file hashes against manifest")
+    console.log("[dry-run] Would download only missing/changed files\n")
     return
   }
 
-  await performPull(cfg, key)
+  const result = await performPull(cfg, r2Prefix, manifestKey)
 
-  p.outro("Workspace successfully restored from backup (^_<) ~*")
+  if (result.errors.length > 0) {
+    warn(`${result.errors.length} error(s) occurred during pull`, "pull")
+  }
+
+  console.log("")
+  console.log(
+    `\x1b[32m✔ Pull complete:\x1b[0m ${result.restoredFiles} restored, ${result.cachedFiles} cached`,
+  )
+  console.log("")
 }
