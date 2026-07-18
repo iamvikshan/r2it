@@ -140,14 +140,6 @@ export async function cmdClone(projectName: string | undefined): Promise<void> {
     name = typed as string
   }
 
-  const newLocal: LocalConfig = {
-    project: name,
-    backup: {
-      retention: 5,
-      paths: [...DEFAULT_PATHS],
-    },
-  }
-
   const r2Prefix = projectR2Prefix(name)
 
   // Try manifest-based restore first (new format)
@@ -159,6 +151,16 @@ export async function cmdClone(projectName: string | undefined): Promise<void> {
     if (latest) {
       s.stop(`Found manifest: ${latest.key}`)
       await restoreFromManifest(global, latest.manifest, r2Prefix, name)
+
+      // Populate paths from manifest entries so subsequent status/push track everything
+      const restoredPaths = Object.keys(latest.manifest.entries)
+      const newLocal: LocalConfig = {
+        project: name,
+        backup: {
+          retention: 5,
+          paths: restoredPaths.length > 0 ? restoredPaths : [...DEFAULT_PATHS],
+        },
+      }
       await writeLocalConfig(newLocal)
       p.outro(
         "Local .r2gitconfig created. Ready to run r2git status and r2git push (^_<) ~*",
@@ -184,7 +186,10 @@ export async function cmdClone(projectName: string | undefined): Promise<void> {
     if (latest) {
       info("Found legacy tar backup — restoring...", "clone")
       await restoreFromTar(global, latest.key)
-      await writeLocalConfig(newLocal)
+      await writeLocalConfig({
+        project: name,
+        backup: { retention: 5, paths: [...DEFAULT_PATHS] },
+      })
       p.outro(
         "Local .r2gitconfig created. Ready to run r2git status and r2git push (^_<) ~*",
       )
