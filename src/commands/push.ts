@@ -2,11 +2,26 @@ import * as p from "@clack/prompts"
 import {
   resolveActiveProjectConfig,
   projectR2Prefix,
-  resolveTarPaths,
 } from "../utils/config"
 import { uploadObject, listObjects, deleteObject } from "../utils/r2"
 import { getCurrentDirBasename } from "../utils/git"
-import { checkPathExists, homeDir } from "../utils/fs"
+import {
+  checkPathExists,
+  resolvePaths,
+  buildPathContext,
+  getFileSize,
+  isDirectory,
+  isSymlink,
+} from "../utils/fs"
+import {
+  info,
+  warn,
+  error as logError,
+  printPathResult,
+  printPathSummary,
+  formatSize,
+  type PathResult,
+} from "../utils/log"
 import type { ResolvedConfig, R2Config } from "../utils/types"
 
 const TMP_TAR = "/tmp/r2git-backup.tar.gz"
@@ -21,14 +36,64 @@ function utcStamp(): string {
   return `${y}-${m}-${d}T${h}-${min}Z`
 }
 
-function formatSize(bytes: number): string {
-  if (bytes > 1_000_000) return `${(bytes / 1_000_000).toFixed(1)} MB`
-  if (bytes > 1_000) return `${(bytes / 1_000).toFixed(0)} KB`
-  return `${bytes} B`
+/**
+ * Validate and resolve all tracked paths.
+ * Returns detailed results for each path — exists, missing, error, etc.
+ */
+async function validatePaths(
+  cfg: ResolvedConfig,
+): Promise<{ results: PathResult[]; existing: string[] }> {
+  const ctx = buildPathContext(cfg.project)
+  const resolved = resolvePaths(cfg.backup.paths, ctx)
+  const results: PathResult[] = []
+  const existing: string[] = []
+
+  for (const r of resolved) {
+    try {
+      const exists = await checkPathExists(r.absolute)
+      if (!exists) {
+        results.push({
+          path: r.original,
+          status: "skipped",
+          reason: "file not found",
+        })
+        continue
+      }
+
+      // Check if it's a directory — tar handles these fine
+      const dir = await isDirectory(r.absolute)
+      if (dir) {
+        const size = await getFileSize(r.absolute)
+        results.push({
+          path: r.original,
+          status: "ok",
+          size: size ?? 0,
+        })
+        existing.push(r.relative)
+        continue
+      }
+
+      const size = await getFileSize(r.absolute)
+      results.push({
+        path: r.original,
+        status: "ok",
+        size: size ?? undefined,
+      })
+      existing.push(r.relative)
+    } catch (e) {
+      results.push({
+        path: r.original,
+        status: "error",
+        reason: e instanceof Error ? e.message : String(e),
+      })
+    }
+  }
+
+  return { results, existing }
 }
 
 function tarPaths(paths: string[], label: string): boolean {
-  console.log(`\nArchiving ${label}...`)
+  info(`Archiving ${paths.length} path(s)...`, "tar")
   const proc = Bun.spawnSync([
     "tar",
     "-czf",
@@ -39,34 +104,26 @@ function tarPaths(paths: string[], label: string): boolean {
     ...paths,
   ])
   if (!proc.success) {
-    console.error(`tar failed: ${proc.stderr.toString()}`)
+    const stderr = proc.stderr.toString().trim()
+    logError(`tar exited with code ${proc.exitCode}`, "tar")
+    if (stderr) {
+      for (const line of stderr.split("\n").slice(0, 10)) {
+        logError(`  ${line}`, "tar")
+      }
+      if (stderr.split("\n").length > 10) {
+        logError(`  ... (${stderr.split("\n").length - 10} more lines)`, "tar")
+      }
+    }
     return false
   }
   return true
-}
-
-async function getExistingPaths(
-  paths: string[],
-  cwd: string,
-  home: string,
-): Promise<string[]> {
-  const resolved = resolveTarPaths(paths, cwd, home)
-  const existing: string[] = []
-  for (const path of resolved) {
-    const abs = "/" + path
-    if (await checkPathExists(abs)) {
-      existing.push(path)
-    }
-  }
-  return existing
 }
 
 async function enforceRetention(
   r2: R2Config,
   r2Prefix: string,
   retention: number,
-  spinner: ReturnType<typeof p.spinner>,
-): Promise<void> {
+): Promise<number> {
   try {
     const all = await listObjects(r2, r2Prefix)
     const backups = all
@@ -80,19 +137,17 @@ async function enforceRetention(
       const stale = backups.slice(retention)
       for (const a of stale) {
         await deleteObject(r2, a.key)
+        info(`Deleted old backup: ${a.key}`, "retention")
       }
-      spinner.stop(
-        `Retention cleanup complete: deleted ${stale.length} older backup(s).`,
-      )
-    } else {
-      spinner.stop(
-        `Retention: ${backups.length} backup(s) on R2 (no cleanup needed).`,
-      )
+      return stale.length
     }
+    return 0
   } catch (e) {
-    spinner.stop(
+    warn(
       `Retention cleanup failed: ${e instanceof Error ? e.message : String(e)}`,
+      "retention",
     )
+    return 0
   }
 }
 
@@ -114,22 +169,22 @@ async function performPush(
   try {
     const file = Bun.file(TMP_TAR)
     const size = file.size
+    s.message(`Uploading ${formatSize(size)} to R2...`)
     const buf = await file.arrayBuffer()
     await uploadObject(cfg.r2, key, buf, "application/gzip")
-    s.stop(`Backup uploaded successfully: ${key} (${formatSize(size)})`)
+    s.stop(`Backup uploaded: ${key} (${formatSize(size)})`)
   } catch (e) {
     s.stop("Upload failed.")
-    console.error(e instanceof Error ? e.message : String(e))
+    logError(e instanceof Error ? e.message : String(e), "upload")
     Bun.spawnSync(["rm", "-f", TMP_TAR])
     process.exit(1)
   }
   Bun.spawnSync(["rm", "-f", TMP_TAR])
 
-  const cleanupSpinner = p.spinner()
-  cleanupSpinner.start(
-    `Enforcing backup retention policy (retaining last ${retention})...`,
-  )
-  await enforceRetention(cfg.r2, r2Prefix, retention, cleanupSpinner)
+  const cleaned = await enforceRetention(cfg.r2, r2Prefix, retention)
+  if (cleaned > 0) {
+    info(`Cleaned up ${cleaned} old backup(s)`, "retention")
+  }
 }
 
 export async function cmdPush(args: string[]): Promise<void> {
@@ -151,31 +206,50 @@ export async function cmdPush(args: string[]): Promise<void> {
       ? (args[prefixIdx + 1] ?? cfg.backup.prefix)
       : cfg.backup.prefix
   const dryRun = args.includes("--dry-run") || args.includes("-n")
+  const verbose = args.includes("--verbose") || args.includes("-v")
+  const quiet = args.includes("--quiet") || args.includes("-q")
+
+  if (verbose) {
+    const { setLogLevel } = await import("../utils/log")
+    setLogLevel("debug")
+  }
 
   const r2Prefix = projectR2Prefix(cfg.project, pkgPrefix)
   const key = `${r2Prefix}${utcStamp()}.tar.gz`
 
-  const existingPaths = await getExistingPaths(
-    cfg.backup.paths,
-    process.cwd(),
-    homeDir(),
-  )
+  // Validate all tracked paths with detailed reporting
+  if (!quiet) {
+    info(`Project: ${cfg.project}`, "push")
+    info(`Tracked paths: ${cfg.backup.paths.length}`, "push")
+    console.log("")
+  }
 
-  if (existingPaths.length === 0) {
+  const { results, existing } = await validatePaths(cfg)
+
+  if (!quiet) {
+    // Show per-path results
+    for (const r of results) {
+      printPathResult(r)
+    }
+    printPathSummary(results)
+  }
+
+  if (existing.length === 0) {
     p.cancel("Error: No tracked paths exist locally. Nothing to backup.")
     process.exit(1)
   }
 
   if (dryRun) {
-    console.log(`\n[dry-run] Project: ${cfg.project}`)
-    console.log("[dry-run] Would archive these paths:")
-    existingPaths.forEach(p => {
+    console.log(`[dry-run] Project: ${cfg.project}`)
+    console.log(`[dry-run] Would archive ${existing.length} path(s):`)
+    for (const p of existing) {
       console.log(`  /${p}`)
-    })
+    }
     console.log(`[dry-run] Would upload to R2 as: ${key}`)
-    console.log(`[dry-run] Would retain ${retention} most recent backups\n`)
+    console.log(`[dry-run] Would retain ${retention} most recent backups`)
+    console.log("")
     return
   }
 
-  await performPush(cfg, key, existingPaths, retention, r2Prefix)
+  await performPush(cfg, key, existing, retention, r2Prefix)
 }

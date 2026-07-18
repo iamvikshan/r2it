@@ -6,6 +6,7 @@ import {
   DEFAULT_PATHS,
 } from "../utils/config"
 import { listObjects, downloadObject } from "../utils/r2"
+import { info, error as logError, formatSize } from "../utils/log"
 import type { LocalConfig } from "../utils/types"
 
 const TMP_TAR = "/tmp/r2git-backup.tar.gz"
@@ -67,7 +68,7 @@ export async function cmdClone(projectName: string | undefined): Promise<void> {
     }
   } catch (e) {
     s.stop("Failed to query R2 backups.")
-    console.error(e instanceof Error ? e.message : String(e))
+    logError(e instanceof Error ? e.message : String(e), "clone")
     process.exit(1)
   }
 
@@ -83,9 +84,10 @@ export async function cmdClone(projectName: string | undefined): Promise<void> {
   try {
     const buf = await downloadObject(global.r2, latestKey)
     await Bun.write(TMP_TAR, buf)
+    info(`Downloaded ${formatSize(buf.byteLength)}`, "clone")
   } catch (e) {
     s.stop("Download failed.")
-    console.error(e instanceof Error ? e.message : String(e))
+    logError(e instanceof Error ? e.message : String(e), "download")
     process.exit(1)
   }
 
@@ -94,7 +96,12 @@ export async function cmdClone(projectName: string | undefined): Promise<void> {
     const proc = Bun.spawnSync(["tar", "-xzf", TMP_TAR, "-C", "/"])
     if (!proc.success) {
       s.stop("Extraction failed.")
-      console.error(proc.stderr.toString())
+      const stderr = proc.stderr.toString().trim()
+      if (stderr) {
+        for (const line of stderr.split("\n").slice(0, 10)) {
+          logError(`  ${line}`, "tar")
+        }
+      }
       Bun.spawnSync(["rm", "-f", TMP_TAR])
       process.exit(1)
     }

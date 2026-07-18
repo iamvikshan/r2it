@@ -1,14 +1,15 @@
 import { resolveActiveProjectConfig, projectR2Prefix } from "../utils/config"
 import { listObjects } from "../utils/r2"
 import { getCurrentDirBasename } from "../utils/git"
-import { checkPathExists, getMaxMTime } from "../utils/fs"
+import {
+  checkPathExists,
+  getMaxMTime,
+  resolvePaths,
+  buildPathContext,
+  isDirectory,
+} from "../utils/fs"
+import { formatSize } from "../utils/log"
 import type { ResolvedConfig } from "../utils/types"
-
-function formatSize(bytes: number): string {
-  if (bytes > 1_000_000) return `${(bytes / 1_000_000).toFixed(1)} MB`
-  if (bytes > 1_000) return `${(bytes / 1_000).toFixed(0)} KB`
-  return `${bytes} B`
-}
 
 async function printLocalStatus(cfg: ResolvedConfig): Promise<number> {
   console.log(
@@ -26,12 +27,19 @@ async function printLocalStatus(cfg: ResolvedConfig): Promise<number> {
     return 0
   }
 
+  const ctx = buildPathContext(cfg.project)
+  const resolved = resolvePaths(cfg.backup.paths, ctx)
+
   console.log("Tracked Files & Directories:")
   let maxLocalTime = 0
-  for (const path of cfg.backup.paths) {
-    const exists = await checkPathExists(path)
+  let existingCount = 0
+  let missingCount = 0
+
+  for (const r of resolved) {
+    const exists = await checkPathExists(r.absolute)
     if (exists) {
-      const mtime = await getMaxMTime(path)
+      existingCount++
+      const mtime = await getMaxMTime(r.absolute)
       if (mtime) {
         maxLocalTime = Math.max(maxLocalTime, mtime)
         const dateStr = new Date(mtime)
@@ -39,16 +47,20 @@ async function printLocalStatus(cfg: ResolvedConfig): Promise<number> {
           .replace("T", " ")
           .slice(0, 19)
         console.log(
-          `  \x1b[32m✔\x1b[0m ${path} \x1b[90m(exists, last modified: ${dateStr})\x1b[0m`,
+          `  \x1b[32m✔\x1b[0m ${r.original} \x1b[90m(exists, last modified: ${dateStr})\x1b[0m`,
         )
       } else {
-        console.log(`  \x1b[32m✔\x1b[0m ${path} \x1b[90m(exists)\x1b[0m`)
+        console.log(`  \x1b[32m✔\x1b[0m ${r.original} \x1b[90m(exists)\x1b[0m`)
       }
     } else {
-      console.log(`  \x1b[31m✖\x1b[0m ${path} \x1b[90m(missing)\x1b[0m`)
+      missingCount++
+      console.log(`  \x1b[31m✖\x1b[0m ${r.original} \x1b[90m(missing)\x1b[0m`)
     }
   }
-  console.log("")
+
+  console.log(
+    `\n  ${existingCount} found, ${missingCount} missing\n`,
+  )
   return maxLocalTime
 }
 

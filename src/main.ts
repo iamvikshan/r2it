@@ -8,6 +8,7 @@ import { cmdLog } from "./commands/log"
 import { cmdClone } from "./commands/clone"
 import { cmdAuth } from "./commands/auth"
 import { cmdProject } from "./commands/project"
+import { setLogLevel } from "./utils/log"
 
 function help(status: number): never {
   console.log(`
@@ -32,6 +33,8 @@ ADDITIONAL COMMANDS
 
 GLOBAL FLAGS
   -h, --help                Show help for r2git or a command
+  -v, --verbose             Enable verbose/debug logging
+  -q, --quiet               Suppress non-essential output
 
 PUSH/PULL FLAGS
   -y, --yes                 Skip confirmations
@@ -76,6 +79,9 @@ const commandRegistry: Record<string, CommandRunner> = {
   log: async args => {
     await cmdLog(args)
   },
+  history: async args => {
+    await cmdLog(args)
+  },
   list: async args => {
     await cmdLog(args)
   },
@@ -92,13 +98,27 @@ const commandRegistry: Record<string, CommandRunner> = {
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2)
-  const cmd = args[0]
+
+  // Handle global flags before command dispatch
+  if (args.includes("--verbose") || args.includes("-v")) {
+    setLogLevel("debug")
+  }
+  if (args.includes("--quiet") || args.includes("-q")) {
+    setLogLevel("error")
+  }
+
+  // Strip global flags from args passed to commands
+  const filteredArgs = args.filter(
+    a => a !== "--verbose" && a !== "-v" && a !== "--quiet" && a !== "-q",
+  )
+
+  const cmd = filteredArgs[0]
 
   if (!cmd || cmd === "--help" || cmd === "-h") help(0)
 
   const runner = commandRegistry[cmd]
   if (runner) {
-    await runner(args.slice(1))
+    await runner(filteredArgs.slice(1))
   } else {
     console.error(`Unknown command: ${cmd}`)
     help(1)

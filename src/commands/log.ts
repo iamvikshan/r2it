@@ -2,12 +2,7 @@ import * as p from "@clack/prompts"
 import { resolveActiveProjectConfig, projectR2Prefix } from "../utils/config"
 import { listObjects } from "../utils/r2"
 import { getCurrentDirBasename } from "../utils/git"
-
-function formatSize(bytes: number): string {
-  if (bytes > 1_000_000) return `${(bytes / 1_000_000).toFixed(1)} MB`
-  if (bytes > 1_000) return `${(bytes / 1_000).toFixed(0)} KB`
-  return `${bytes} B`
-}
+import { formatSize } from "../utils/log"
 
 export async function cmdLog(args: string[]): Promise<void> {
   const autoName = getCurrentDirBasename()

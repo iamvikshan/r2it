@@ -2,15 +2,10 @@ import * as p from "@clack/prompts"
 import { resolveActiveProjectConfig, projectR2Prefix } from "../utils/config"
 import { downloadObject, listObjects } from "../utils/r2"
 import { getCurrentDirBasename } from "../utils/git"
+import { info, error as logError, formatSize } from "../utils/log"
 import type { ResolvedConfig } from "../utils/types"
 
 const TMP_TAR = "/tmp/r2git-backup.tar.gz"
-
-function formatSize(bytes: number): string {
-  if (bytes > 1_000_000) return `${(bytes / 1_000_000).toFixed(1)} MB`
-  if (bytes > 1_000) return `${(bytes / 1_000).toFixed(0)} KB`
-  return `${bytes} B`
-}
 
 async function resolvePullKey(
   cfg: ResolvedConfig,
@@ -76,7 +71,7 @@ async function performPull(cfg: ResolvedConfig, key: string): Promise<void> {
     s.stop(`Download completed: ${formatSize(buf.byteLength)}`)
   } catch (e) {
     s.stop("Download failed.")
-    console.error(e instanceof Error ? e.message : String(e))
+    logError(e instanceof Error ? e.message : String(e), "download")
     process.exit(1)
   }
 
@@ -86,7 +81,12 @@ async function performPull(cfg: ResolvedConfig, key: string): Promise<void> {
     const proc = Bun.spawnSync(["tar", "-xzf", TMP_TAR, "-C", "/"])
     if (!proc.success) {
       extSpinner.stop("Extraction failed.")
-      console.error(proc.stderr.toString())
+      const stderr = proc.stderr.toString().trim()
+      if (stderr) {
+        for (const line of stderr.split("\n").slice(0, 10)) {
+          logError(`  ${line}`, "tar")
+        }
+      }
       Bun.spawnSync(["rm", "-f", TMP_TAR])
       process.exit(1)
     }
