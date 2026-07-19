@@ -10,7 +10,7 @@ import { listObjects, downloadObject } from "../utils/r2"
 import { getLatestManifest, downloadObjectByHash } from "../utils/store"
 import { buildPathContext, resolvePath } from "../utils/fs"
 import { info, warn, error as logError, formatSize } from "../utils/log"
-import { restoreSymlinkTarFromR2 } from "../utils/symlink-restore"
+import { restoreSymlinkTarFromR2 } from "../helpers/symlink-restore"
 
 import type { Manifest } from "../utils/store-types"
 

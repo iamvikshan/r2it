@@ -192,6 +192,7 @@ commit.**
 ### Log
 
 - `-v, --verbose`: Show entry counts and parent info per manifest
+- `--prefix <p>`: Override backup prefix
 
 ---
 

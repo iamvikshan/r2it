@@ -12,7 +12,7 @@ import {
   downloadManifest,
 } from "../utils/store"
 import { warn, error as logError, formatSize } from "../utils/log"
-import { restoreSymlinkTarFromR2 } from "../utils/symlink-restore"
+import { restoreSymlinkTarFromR2 } from "../helpers/symlink-restore"
 import type { ResolvedConfig } from "../utils/types"
 import type { Manifest, PullResult } from "../utils/store-types"
 
@@ -94,7 +94,7 @@ async function restoreSymlinkTar(
         `Invalid symlink archive for ${path}: ${result.error ?? "validation failed"}`,
         "pull",
       )
-    } else if (result.status === "install-failed") {
+    } else {
       logError(`Failed to install symlink for ${path}`, "pull")
     }
 

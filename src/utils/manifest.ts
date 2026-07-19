@@ -11,7 +11,7 @@ import { Glob } from "bun"
 function getFileMode(filePath: string): string {
   try {
     const stat = fs.lstatSync(filePath)
-    return (stat.mode & 0o777).toString(8).padStart(4, "0")
+    return (stat.mode & 0o7777).toString(8).padStart(4, "0")
   } catch {
     return "0644"
   }
