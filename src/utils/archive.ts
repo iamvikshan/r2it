@@ -1,6 +1,14 @@
 import { Glob } from "bun"
 import type { ManifestEntry, ObjectType } from "./store-types"
-import { lstatSync, writeFileSync, unlinkSync, mkdirSync } from "node:fs"
+import {
+  lstatSync,
+  writeFileSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+} from "node:fs"
+import { join } from "node:path"
+import { tmpdir } from "node:os"
 
 /**
  * Create a tar.gz archive from a list of absolute paths.
@@ -91,23 +99,24 @@ export function createArchive(
   }
 
   // Create tar.gz using system tar
-  // We write the file list to a temp file to avoid arg length limits
-  const tmpList = `/tmp/r2git-archive-${Date.now()}.txt`
-  writeFileSync(tmpList, validPaths.join("\n"))
+  // Use a private temp directory to avoid symlink races and simultaneous-push corruption
+  const tmpDir = mkdtempSync(join(tmpdir(), "r2git-archive-"))
+  const tmpList = join(tmpDir, "files.txt")
+  // NUL-delimited so filenames containing newlines don't break
+  writeFileSync(tmpList, validPaths.join("\0"))
 
   try {
-    const proc = Bun.spawnSync(["tar", "-czf", "-", "--files-from", tmpList], {
-      stdin: null,
-    })
+    const proc = Bun.spawnSync(
+      ["tar", "-czf", "-", "--null", "--files-from", tmpList],
+      { stdin: null },
+    )
     if (!proc.success) {
       throw new Error(`tar failed: ${proc.stderr.toString()}`)
     }
 
-    const archive = proc.stdout
-
-    return { archive, entries, errors }
+    return { archive: proc.stdout, entries, errors }
   } finally {
-    unlinkSync(tmpList)
+    rmSync(tmpDir, { recursive: true, force: true })
   }
 }
 
