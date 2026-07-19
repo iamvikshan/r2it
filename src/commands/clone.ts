@@ -136,6 +136,39 @@ async function promptProjectName(): Promise<string> {
   return typed as string
 }
 
+async function lookupLatestBackup(
+  global: ReturnType<typeof loadGlobalConfig> extends Promise<infer T>
+    ? T
+    : never,
+  name: string,
+  r2Prefix: string,
+): Promise<{ manifest: Manifest; key: string }> {
+  const s = p.spinner()
+  s.start(`Looking up backups for '${name}'...`)
+
+  let latest: { manifest: Manifest; key: string } | null = null
+  let lookupError: string | null = null
+  try {
+    latest = await getLatestManifest(global.r2, r2Prefix)
+  } catch (e) {
+    lookupError = e instanceof Error ? e.message : String(e)
+  }
+
+  if (!latest) {
+    s.stop("No backups found.")
+    if (lookupError) {
+      logError(`Failed to query backups: ${lookupError}`, "clone")
+    }
+    p.cancel(
+      `No backups found on R2 for project '${name}' under prefix '${r2Prefix}'.`,
+    )
+    process.exit(1)
+  }
+
+  s.stop(`Found manifest: ${latest.key}`)
+  return latest
+}
+
 export async function cmdClone(projectName: string | undefined): Promise<void> {
   p.intro("r2git clone")
   const global = await loadGlobalConfig()
@@ -157,27 +190,7 @@ export async function cmdClone(projectName: string | undefined): Promise<void> {
   const pkgPrefix = projectCfg ? projectCfg.backup.prefix : undefined
   const r2Prefix = projectR2Prefix(name, pkgPrefix)
 
-  const s = p.spinner()
-  s.start(`Looking up backups for '${name}'...`)
-
-  let latest: { manifest: Manifest; key: string } | null = null
-  try {
-    latest = await getLatestManifest(global.r2, r2Prefix)
-  } catch (e) {
-    s.stop("Failed to fetch manifest.")
-    logError(e instanceof Error ? e.message : String(e), "clone")
-    process.exit(1)
-  }
-
-  if (!latest) {
-    s.stop("No backups found.")
-    p.cancel(
-      `No backups found on R2 for project '${name}' under prefix '${r2Prefix}'.`,
-    )
-    process.exit(1)
-  }
-
-  s.stop(`Found manifest: ${latest.key}`)
+  const latest = await lookupLatestBackup(global, name, r2Prefix)
 
   const result = await restoreFromManifest(global, latest.manifest, name)
 

@@ -115,8 +115,11 @@ export async function cmdInit(): Promise<void> {
   p.intro("r2git init")
 
   const global = await loadGlobalConfig()
-  const hasCreds =
-    global.r2.accountId && global.r2.accessKeyId && global.r2.secretAccessKey
+  let hasCreds = !!(
+    global.r2.accountId &&
+    global.r2.accessKeyId &&
+    global.r2.secretAccessKey
+  )
 
   // Smart .env detection
   if (!hasCreds) {
@@ -152,13 +155,14 @@ export async function cmdInit(): Promise<void> {
           "Credentials saved to ~/.r2gitrc. r2git will no longer read .env for credentials.",
           "Import Complete",
         )
+        // Recompute credential completeness after import
+        hasCreds = true
       }
     }
   }
 
   const configureR2 =
     !hasCreds &&
-    !global.r2.accountId &&
     (await p.confirm({
       message:
         "Do you want to configure global Cloudflare R2 / Doppler credentials manually?",

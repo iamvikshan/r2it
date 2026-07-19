@@ -1,5 +1,4 @@
 import * as p from "@clack/prompts"
-import picomatch from "picomatch"
 import { resolveActiveProjectConfig, projectR2Prefix } from "../utils/config"
 import { getCurrentDirBasename } from "../utils/git"
 import { resolvePaths, buildPathContext } from "../utils/fs"
@@ -132,7 +131,11 @@ async function createAndUploadArchive(
   const ctx = buildPathContext(cfg.project)
 
   // Build list of paths to archive from the manifest (ignores already applied)
-  const pathsToArchive: Array<{ original: string; absolute: string; relative: string }> = []
+  const pathsToArchive: Array<{
+    original: string
+    absolute: string
+    relative: string
+  }> = []
   for (const originalPath of Object.keys(manifest.entries)) {
     const absolute = resolvePaths([originalPath], ctx)[0]?.absolute
     if (absolute) {
@@ -140,13 +143,6 @@ async function createAndUploadArchive(
       pathsToArchive.push({ original: originalPath, absolute, relative })
     }
   }
-
-  // Apply ignores before archiving
-  const isIgnored =
-    cfg.backup.ignores.length > 0
-      ? picomatch(cfg.backup.ignores, { dot: true, matchBase: true })
-      : () => false
-  const filtered = resolved.filter(r => !isIgnored(r.original))
 
   const s = p.spinner()
   s.start("Creating archive...")

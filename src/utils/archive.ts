@@ -16,7 +16,7 @@ import { tmpdir } from "node:os"
  * Note: Hash field in entries is set to empty string; caller should preserve hashes from buildManifest.
  */
 export function createArchive(
-  paths: Array<{ original: string; absolute: string; relative: string }>,
+  paths: Array<{ original: string; absolute: string }>,
 ): {
   archive: Uint8Array
   entries: Record<string, ManifestEntry>
