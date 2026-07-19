@@ -156,6 +156,12 @@ async function createAndUploadArchive(
     for (const err of archiveErrors) {
       result.errors.push(err)
     }
+    s.stop("Archive creation had errors")
+    logError(
+      `${archiveErrors.length} file(s) failed during archiving — aborting to prevent partial backup`,
+      "push",
+    )
+    return false
   }
 
   if (archive.length === 0) {

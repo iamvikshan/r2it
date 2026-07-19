@@ -29,7 +29,7 @@ export async function downloadArchive(
 }
 
 /**
- * Upload a manifest to R2.
+ * Upload a manifest to R2. On failure, cleans up the archive to prevent orphans.
  */
 export async function uploadManifest(
   r2: R2Config,
@@ -38,9 +38,25 @@ export async function uploadManifest(
 ): Promise<string> {
   const key = manifestKey(manifest.timestamp, projectPrefix)
   const json = serializeManifest(manifest)
-  await uploadObject(r2, key, json, "application/json")
-  debug(`Uploaded manifest ${key}`, "store")
-  return key
+  try {
+    await uploadObject(r2, key, json, "application/json")
+    debug(`Uploaded manifest ${key}`, "store")
+    return key
+  } catch (e) {
+    // Clean up the archive that was uploaded before this manifest
+    if (manifest.archiveKey) {
+      try {
+        await deleteObject(r2, manifest.archiveKey)
+        debug(`Cleaned up orphaned archive ${manifest.archiveKey}`, "store")
+      } catch {
+        debug(
+          `Failed to clean up orphaned archive ${manifest.archiveKey}`,
+          "store",
+        )
+      }
+    }
+    throw e
+  }
 }
 
 /**
@@ -90,6 +106,9 @@ export async function getLatestManifest(
 
 /**
  * Enforce retention on manifests and their archives.
+ * Deletes the manifest first, then its archive. If manifest deletion succeeds
+ * but archive deletion fails, the archive is orphaned but the backup is no
+ * longer selectable — safer than the reverse order.
  */
 export async function enforceManifestRetention(
   r2: R2Config,
@@ -121,24 +140,25 @@ export async function enforceManifestRetention(
 
   let deleted = 0
   for (const m of stale) {
+    let archiveKeyToDelete: string | undefined
+
     try {
-      // Download manifest to get archive key for cleanup
+      // Read the manifest to find its archive key
       const manifest = await downloadManifest(r2, m.key)
+      archiveKeyToDelete = manifest.archiveKey
+    } catch (e) {
+      // If we can't read the manifest, abort this entry — don't risk
+      // deleting an archive that might still be referenced
+      info(
+        `Failed to read manifest ${m.key} for cleanup, skipping: ${e instanceof Error ? e.message : String(e)}`,
+        "retention",
+      )
+      continue
+    }
 
-      // Delete the archive
-      if (manifest.archiveKey) {
-        try {
-          await deleteObject(r2, manifest.archiveKey)
-          debug(`Deleted archive ${manifest.archiveKey}`, "retention")
-        } catch (e) {
-          debug(
-            `Failed to delete archive ${manifest.archiveKey}: ${e instanceof Error ? e.message : String(e)}`,
-            "retention",
-          )
-        }
-      }
-
-      // Delete the manifest
+    try {
+      // Delete the manifest first — if this succeeds, the backup is no
+      // longer selectable even if archive deletion fails
       await deleteObject(r2, m.key)
       deleted++
       info(`Deleted old manifest: ${m.key}`, "retention")
@@ -147,6 +167,20 @@ export async function enforceManifestRetention(
         `Failed to delete manifest ${m.key}: ${e instanceof Error ? e.message : String(e)}`,
         "retention",
       )
+      continue
+    }
+
+    // Now safe to delete the archive
+    if (archiveKeyToDelete) {
+      try {
+        await deleteObject(r2, archiveKeyToDelete)
+        debug(`Deleted archive ${archiveKeyToDelete}`, "retention")
+      } catch (e) {
+        debug(
+          `Failed to delete archive ${archiveKeyToDelete}: ${e instanceof Error ? e.message : String(e)}`,
+          "retention",
+        )
+      }
     }
   }
 
