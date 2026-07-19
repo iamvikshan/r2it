@@ -16,6 +16,7 @@ async function handleIgnoreFlag(
     .slice(1)
     .flatMap(arg => arg.split(",").map(s => s.trim()))
     .filter(Boolean)
+>>>>>>> e1cd5af (fix: ignore system — CLI splitting, directory skipping, archive filtering, validation)
   if (patterns.length === 0) {
     const typed = await p.text({
       message: "Enter ignore pattern(s) to add (comma-separated)",

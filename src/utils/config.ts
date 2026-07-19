@@ -208,7 +208,9 @@ export async function loadLocalConfig(): Promise<LocalConfig | null> {
         ? (backup.paths as string[])
         : [...DEFAULT_PATHS],
       ignores: Array.isArray((backup as { ignores?: unknown }).ignores)
-        ? (backup as { ignores: string[] }).ignores
+        ? (backup as { ignores: unknown[] }).ignores.filter(
+            (i): i is string => typeof i === "string",
+          )
         : [],
     }
     if (typeof backup.prefix === "string") {
@@ -265,10 +267,18 @@ export async function resolveActiveProjectConfig(
   const project = global.activeProject ?? autoName
   const projectCfg = global.projects[project] ?? defaultProject(project)
 
+  // Normalize backup config — ensure ignores is always an array
+  const backup = {
+    ...projectCfg.backup,
+    ignores: Array.isArray(projectCfg.backup.ignores)
+      ? projectCfg.backup.ignores
+      : [],
+  }
+
   return {
     project,
     r2,
-    backup: projectCfg.backup,
+    backup,
     isLocal: false,
   }
 }

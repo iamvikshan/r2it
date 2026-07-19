@@ -105,6 +105,7 @@ async function finishClone(
   pkgPrefix: string | undefined,
   retention: number,
   paths: string[],
+  ignores: string[] = [],
 ): Promise<void> {
   await writeLocalConfig({
     project: name,
@@ -112,7 +113,7 @@ async function finishClone(
       retention,
       ...(pkgPrefix !== undefined && { prefix: pkgPrefix }),
       paths,
-      ignores: [],
+      ignores,
     },
   })
   p.outro(
@@ -192,5 +193,12 @@ export async function cmdClone(projectName: string | undefined): Promise<void> {
   const configuredPaths =
     projectCfg?.backup.paths ??
     (manifestPaths.length > 0 ? manifestPaths : [...DEFAULT_PATHS])
-  await finishClone(name, pkgPrefix, defaultRetention, configuredPaths)
+  const configuredIgnores = projectCfg?.backup.ignores ?? []
+  await finishClone(
+    name,
+    pkgPrefix,
+    defaultRetention,
+    configuredPaths,
+    configuredIgnores,
+  )
 }

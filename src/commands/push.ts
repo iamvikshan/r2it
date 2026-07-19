@@ -1,4 +1,5 @@
 import * as p from "@clack/prompts"
+import picomatch from "picomatch"
 import { resolveActiveProjectConfig, projectR2Prefix } from "../utils/config"
 import { getCurrentDirBasename } from "../utils/git"
 import { resolvePaths, buildPathContext } from "../utils/fs"
@@ -140,14 +141,16 @@ async function createAndUploadArchive(
     }
   }
 
+  // Apply ignores before archiving
+  const isIgnored =
+    cfg.backup.ignores.length > 0
+      ? picomatch(cfg.backup.ignores, { dot: true, matchBase: true })
+      : () => false
+  const filtered = resolved.filter(r => !isIgnored(r.original))
+
   const s = p.spinner()
   s.start("Creating archive...")
   const { archive, errors: archiveErrors } = createArchive(pathsToArchive)
-
-  if (archiveErrors.length > 0) {
-=======
-  const { archive, errors: archiveErrors } = createArchive(resolved)
->>>>>>> 831bef0 (fix: preserve per-file hashes instead of overwriting with archive hash)
 
   if (archiveErrors.length > 0) {
     for (const err of archiveErrors) {
