@@ -179,6 +179,7 @@ commit.**
 ### Push
 
 - `-n, --dry-run`: Preview actions without uploading
+- `-y, --yes`: Skip confirmations
 - `--keep <N>`: Override retention count for this push
 - `--prefix <p>`: Override backup prefix
 

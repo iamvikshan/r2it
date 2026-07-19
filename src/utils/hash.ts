@@ -48,11 +48,3 @@ export function objectKey(hash: string, projectPrefix: string): string {
   const rest = hash.slice(2)
   return `${projectPrefix}objects/${dir}/${rest}`
 }
-
-/**
- * Get the R2 manifest key for a given timestamp.
- * e.g. "2026-07-18T07-58Z" → "manifests/2026-07-18T07-58Z.json"
- */
-export function manifestKey(timestamp: string, projectPrefix: string): string {
-  return `${projectPrefix}manifests/${timestamp}.json`
-}

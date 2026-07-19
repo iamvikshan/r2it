@@ -63,7 +63,7 @@ export async function cmdAdd(args: string[]): Promise<void> {
       addedCount++
       info(`Staged tracked path: ${resolved}`, "add")
     } else {
-      console.log(`  \x1b[33mℹ Path already tracked:\x1b[0m ${resolved}`)
+      info(`Path already tracked: ${resolved}`, "add")
     }
   }
 

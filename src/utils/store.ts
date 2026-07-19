@@ -186,11 +186,62 @@ async function gcUnreferencedObjects(
 /**
  * Enforce retention on manifests. Deletes old manifests and their orphaned objects.
  */
+async function collectReferencedHashes(
+  r2: R2Config,
+  manifests: Array<{ key: string; lastModified: string; size: number }>,
+): Promise<Set<string> | null> {
+  const referencedHashes = new Set<string>()
+  for (const m of manifests) {
+    try {
+      const manifest = await downloadManifest(r2, m.key)
+      for (const entry of Object.values(manifest.entries)) {
+        referencedHashes.add(entry.hash)
+      }
+    } catch (e) {
+      debug(
+        `Failed to read manifest ${m.key} for GC, aborting object cleanup: ${e instanceof Error ? e.message : String(e)}`,
+        "retention",
+      )
+      return null
+    }
+  }
+  return referencedHashes
+}
+
+async function deleteStaleManifests(
+  r2: R2Config,
+  stale: Array<{ key: string; lastModified: string; size: number }>,
+): Promise<number> {
+  let deleted = 0
+  for (const m of stale) {
+    try {
+      await deleteObject(r2, m.key)
+      deleted++
+      info(`Deleted old manifest: ${m.key}`, "retention")
+    } catch (e) {
+      debug(
+        `Failed to delete manifest ${m.key}, aborting: ${e instanceof Error ? e.message : String(e)}`,
+        "retention",
+      )
+      return deleted
+    }
+  }
+  return deleted
+}
+
 export async function enforceManifestRetention(
   r2: R2Config,
   projectPrefix: string,
   retention: number,
 ): Promise<number> {
+  if (
+    typeof retention !== "number" ||
+    !Number.isInteger(retention) ||
+    retention < 1
+  ) {
+    debug(`Invalid retention value ${retention}, skipping cleanup`, "retention")
+    return 0
+  }
   let manifests: Array<{ key: string; lastModified: string; size: number }>
   try {
     manifests = await listManifests(r2, projectPrefix)
@@ -206,54 +257,11 @@ export async function enforceManifestRetention(
 
   const stale = manifests.slice(retention)
   const retained = manifests.slice(0, retention)
-  let deleted = 0
 
-  // Collect hashes referenced by retained manifests
-  const referencedHashes = new Set<string>()
-  let retainedReadFailed = false
-  for (const m of retained) {
-    try {
-      const manifest = await downloadManifest(r2, m.key)
-      for (const entry of Object.values(manifest.entries)) {
-        referencedHashes.add(entry.hash)
-      }
-    } catch (e) {
-      retainedReadFailed = true
-      debug(
-        `Failed to read manifest ${m.key} for GC, aborting object cleanup: ${e instanceof Error ? e.message : String(e)}`,
-        "retention",
-      )
-      // Abort object cleanup to prevent incomplete snapshot
-      break
-    }
-  }
+  const referencedHashes = await collectReferencedHashes(r2, retained)
+  if (!referencedHashes) return 0
 
-  // Abort deletion if we couldn't read all retained manifests
-  if (retainedReadFailed) {
-    debug(
-      "Aborting retention cleanup: incomplete manifest snapshot",
-      "retention",
-    )
-    return 0
-  }
-
-  // Delete stale manifests (only if we have a complete snapshot)
-  for (const m of stale) {
-    try {
-      await deleteObject(r2, m.key)
-      deleted++
-      info(`Deleted old manifest: ${m.key}`, "retention")
-    } catch (e) {
-      debug(
-        `Failed to delete manifest ${m.key}, aborting: ${e instanceof Error ? e.message : String(e)}`,
-        "retention",
-      )
-      // Abort if we can't delete a stale manifest
-      return deleted
-    }
-  }
-
-  // Only run GC if we successfully deleted all stale manifests
+  const deleted = await deleteStaleManifests(r2, stale)
   if (deleted === stale.length) {
     await gcUnreferencedObjects(r2, projectPrefix, referencedHashes)
   }

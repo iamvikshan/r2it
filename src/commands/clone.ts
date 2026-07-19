@@ -1,3 +1,4 @@
+import fs from "node:fs"
 import * as p from "@clack/prompts"
 import {
   loadGlobalConfig,
@@ -27,35 +28,45 @@ async function restoreSymlinkTarEntry(
   const extractDir = `${tmpDir}/r2git-extract-${entry.hash}-${Date.now()}`
   try {
     await Bun.write(tmpTar, data)
-    Bun.spawnSync(["mkdir", "-p", extractDir])
+    fs.mkdirSync(extractDir, { recursive: true })
     const extractProc = Bun.spawnSync(["tar", "-xf", tmpTar, "-C", extractDir])
     if (!extractProc.success) return false
-    // Validate that exactly one symlink was extracted
-    const listProc = Bun.spawnSync(["find", extractDir, "-type", "l"])
-    const symlinks = listProc.stdout
-      .toString()
-      .trim()
-      .split("\n")
-      .filter(l => l)
+    function findSymlinks(dir: string): string[] {
+      const results: string[] = []
+      try {
+        for (const entry of fs.readdirSync(dir, {
+          withFileTypes: true,
+          recursive: true,
+        })) {
+          if (entry.isSymbolicLink()) {
+            results.push(entry.parentPath + "/" + entry.name)
+          }
+        }
+      } catch {}
+      return results
+    }
+    const symlinks = findSymlinks(extractDir)
     if (symlinks.length !== 1) return false
     const extractedLink = symlinks[0]
     if (!extractedLink) return false
-    // Ensure the destination parent exists (symlink-only nested paths
-    // may have no parent on a fresh machine), and clear any existing
-    // destination so a directory→symlink transition replaces the old
-    // directory instead of copying the link inside it.
     const parentDir =
       absolutePath.lastIndexOf("/") > 0
         ? absolutePath.substring(0, absolutePath.lastIndexOf("/"))
         : "/"
-    Bun.spawnSync(["mkdir", "-p", parentDir])
-    Bun.spawnSync(["rm", "-rf", absolutePath])
-    // Install the validated symlink at the manifest-derived absolutePath
-    const installProc = Bun.spawnSync(["cp", "-a", extractedLink, absolutePath])
-    return installProc.success
+    fs.mkdirSync(parentDir, { recursive: true })
+    fs.rmSync(absolutePath, { force: true, recursive: true })
+    try {
+      fs.cpSync(extractedLink, absolutePath, {
+        recursive: true,
+        dereference: false,
+      })
+      return true
+    } catch {
+      return false
+    }
   } finally {
-    Bun.spawnSync(["rm", "-rf", extractDir])
-    Bun.spawnSync(["rm", "-f", tmpTar])
+    fs.rmSync(extractDir, { force: true, recursive: true })
+    fs.rmSync(tmpTar, { force: true })
   }
 }
 
@@ -64,24 +75,21 @@ async function restoreFileEntry(
   entry: Manifest["entries"][string],
   r2Prefix: string,
   absolutePath: string,
+  path?: string,
 ): Promise<boolean> {
   const data = await downloadObjectByHash(globalConfig.r2, entry.hash, r2Prefix)
   const dir =
     absolutePath.lastIndexOf("/") > 0
       ? absolutePath.substring(0, absolutePath.lastIndexOf("/"))
       : "/"
-  Bun.spawnSync(["mkdir", "-p", dir])
+  fs.mkdirSync(dir, { recursive: true })
   await Bun.write(absolutePath, data)
   try {
-    const chmodProc = Bun.spawnSync([
-      "chmod",
-      parseInt(entry.mode, 8).toString(8),
-      absolutePath,
-    ])
-    return chmodProc.success && chmodProc.exitCode === 0
+    fs.chmodSync(absolutePath, parseInt(entry.mode, 8))
   } catch {
-    return false
+    warn(`Could not set permissions on ${path ?? absolutePath}`, "clone")
   }
+  return true
 }
 
 /**
@@ -112,7 +120,13 @@ async function restoreFromManifest(
               r2Prefix,
               absolutePath,
             )
-          : await restoreFileEntry(globalConfig, entry, r2Prefix, absolutePath)
+          : await restoreFileEntry(
+              globalConfig,
+              entry,
+              r2Prefix,
+              absolutePath,
+              path,
+            )
       if (ok) restored++
       else errors++
     } catch (e) {
@@ -169,7 +183,7 @@ async function restoreFromTar(
       process.exit(1)
     }
   } finally {
-    Bun.spawnSync(["rm", "-f", tmpTar])
+    fs.rmSync(tmpTar, { force: true })
   }
 }
 

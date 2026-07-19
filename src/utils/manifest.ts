@@ -1,6 +1,7 @@
 import type { Manifest, ManifestEntry, ObjectType } from "./store-types"
 import { hashFile, hashBuffer } from "./hash"
 import { checkPathExists, isSymlink, isDirectory, getFileSize } from "./fs"
+import fs from "node:fs"
 
 import { Glob } from "bun"
 
@@ -9,11 +10,8 @@ import { Glob } from "bun"
  */
 function getFileMode(filePath: string): string {
   try {
-    const proc = Bun.spawnSync(["stat", "-c", "%a", filePath])
-    if (proc.exitCode === 0) {
-      return proc.stdout.toString().trim().padStart(4, "0")
-    }
-    return "0644"
+    const stat = fs.lstatSync(filePath)
+    return (stat.mode & 0o777).toString(8).padStart(4, "0")
   } catch {
     return "0644"
   }
@@ -24,12 +22,8 @@ function getFileMode(filePath: string): string {
  */
 function getFileMTime(filePath: string): string {
   try {
-    const proc = Bun.spawnSync(["stat", "-c", "%Y", filePath])
-    if (proc.exitCode === 0) {
-      const unix = parseInt(proc.stdout.toString().trim(), 10)
-      return new Date(unix * 1000).toISOString()
-    }
-    return new Date().toISOString()
+    const stat = fs.lstatSync(filePath)
+    return new Date(stat.mtimeMs).toISOString()
   } catch {
     return new Date().toISOString()
   }
@@ -146,15 +140,15 @@ export async function buildManifest(
           dot: true,
         })) {
           // Skip directory entries — only files and symlinks can be hashed
-          const typeProc = Bun.spawnSync(["stat", "-c", "%F", entry])
-          if (typeProc.exitCode !== 0) {
+          try {
+            if (fs.lstatSync(entry).isDirectory()) continue
+          } catch {
             errors.push({
               path: entry,
               reason: "Failed to determine file type",
             })
             continue
           }
-          if (typeProc.stdout.toString().trim() === "directory") continue
           const relPath = entry.slice(p.absolute.length).replace(/^\//, "")
           const originalPath = `${p.original}/${relPath}`
           expandedPaths.push({ original: originalPath, absolute: entry })

@@ -32,7 +32,11 @@ export function log(level: LogLevel, message: string, context?: string): void {
   if (!shouldLog(level)) return
   const tag = LEVEL_LABELS[level]
   const ctx = context ? ` \x1b[90m[${context}]\x1b[0m` : ""
-  console.log(`${tag}${ctx} ${message}`)
+  if (level === "error") {
+    console.error(`${tag}${ctx} ${message}`)
+  } else {
+    console.log(`${tag}${ctx} ${message}`)
+  }
 }
 
 export function debug(message: string, context?: string): void {

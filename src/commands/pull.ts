@@ -1,8 +1,10 @@
+import fs from "node:fs"
 import * as p from "@clack/prompts"
 import { resolveActiveProjectConfig, projectR2Prefix } from "../utils/config"
 import { getCurrentDirBasename } from "../utils/git"
 import { resolvePath, buildPathContext, checkPathExists } from "../utils/fs"
-import { hashFile } from "../utils/hash"
+import { hashFile, hashBuffer } from "../utils/hash"
+import { tarSymlink } from "../utils/manifest"
 import {
   downloadObjectByHash,
   getLatestManifest,
@@ -12,6 +14,54 @@ import {
 import { warn, error as logError, formatSize } from "../utils/log"
 import type { ResolvedConfig } from "../utils/types"
 import type { Manifest, PullResult } from "../utils/store-types"
+
+function findSymlinks(dir: string): string[] {
+  const results: string[] = []
+  try {
+    for (const entry of fs.readdirSync(dir, {
+      withFileTypes: true,
+      recursive: true,
+    })) {
+      if (entry.isSymbolicLink()) {
+        results.push(entry.parentPath + "/" + entry.name)
+      }
+    }
+  } catch {}
+  return results
+}
+
+async function resolveSpecificManifest(
+  cfg: ResolvedConfig,
+  r2Prefix: string,
+  key: string,
+  s: ReturnType<typeof p.spinner>,
+): Promise<Manifest> {
+  if (key.endsWith(".tar.gz")) {
+    s.stop(
+      "Legacy tar backup specified — not supported in pull. Use clone for tar backups.",
+    )
+    p.cancel(
+      "Pull only supports manifest-based backups. Specify a .json manifest key or omit --backup.",
+    )
+    process.exit(1)
+  }
+  if (!key.endsWith(".json")) {
+    const manifests = await listManifests(cfg.r2, r2Prefix)
+    const prefix = `${r2Prefix}manifests/${key}`
+    const match = manifests.find(m => m.key.startsWith(prefix))
+    if (match) {
+      key = match.key
+      s.message(`Resolved ${key}`)
+    } else {
+      s.stop(`No manifest found matching timestamp: ${key}`)
+      p.cancel(
+        `No manifest found matching '${key}'. Use 'r2git log' to see available backups.`,
+      )
+      process.exit(1)
+    }
+  }
+  return downloadManifest(cfg.r2, key)
+}
 
 /**
  * Restore a single file from the manifest.
@@ -23,8 +73,20 @@ async function restoreSymlinkTar(
   path: string,
   entry: Manifest["entries"][string],
   absolutePath: string,
-): Promise<"restored" | "error"> {
+): Promise<"restored" | "cached" | "error"> {
   try {
+    // Cache check: if local symlink matches, skip download
+    try {
+      if (fs.lstatSync(absolutePath).isSymbolicLink()) {
+        const localTar = tarSymlink(absolutePath)
+        const localHash = hashBuffer(localTar)
+        if (localHash === entry.hash) {
+          return "cached"
+        }
+      }
+    } catch {
+      // Path doesn't exist or can't be read — proceed with download
+    }
     const data = await downloadObjectByHash(r2Config, entry.hash, projectPrefix)
     // Write tar to temp and extract into isolated directory
     const tmpDir = process.env.TMPDIR ?? process.env.TEMP ?? "/tmp"
@@ -32,7 +94,7 @@ async function restoreSymlinkTar(
     const extractDir = `${tmpDir}/r2git-extract-${entry.hash}-${Date.now()}`
     try {
       await Bun.write(tmpTar, data)
-      Bun.spawnSync(["mkdir", "-p", extractDir])
+      fs.mkdirSync(extractDir, { recursive: true })
       const extractProc = Bun.spawnSync([
         "tar",
         "-xf",
@@ -45,12 +107,7 @@ async function restoreSymlinkTar(
         return "error"
       }
       // Validate that exactly one symlink was extracted
-      const listProc = Bun.spawnSync(["find", extractDir, "-type", "l"])
-      const symlinks = listProc.stdout
-        .toString()
-        .trim()
-        .split("\n")
-        .filter(l => l)
+      const symlinks = findSymlinks(extractDir)
       if (symlinks.length !== 1) {
         logError(
           `Invalid symlink archive for ${path}: expected 1 symlink, found ${symlinks.length}`,
@@ -71,23 +128,22 @@ async function restoreSymlinkTar(
         absolutePath.lastIndexOf("/") > 0
           ? absolutePath.substring(0, absolutePath.lastIndexOf("/"))
           : "/"
-      Bun.spawnSync(["mkdir", "-p", parentDir])
-      Bun.spawnSync(["rm", "-rf", absolutePath])
+      fs.mkdirSync(parentDir, { recursive: true })
+      fs.rmSync(absolutePath, { force: true, recursive: true })
       // Install the validated symlink at the manifest-derived absolutePath
-      const installProc = Bun.spawnSync([
-        "cp",
-        "-a",
-        extractedLink,
-        absolutePath,
-      ])
-      if (!installProc.success) {
+      try {
+        fs.cpSync(extractedLink, absolutePath, {
+          recursive: true,
+          dereference: false,
+        })
+      } catch {
         logError(`Failed to install symlink for ${path}`, "pull")
         return "error"
       }
       return "restored"
     } finally {
-      Bun.spawnSync(["rm", "-rf", extractDir])
-      Bun.spawnSync(["rm", "-f", tmpTar])
+      fs.rmSync(extractDir, { force: true, recursive: true })
+      fs.rmSync(tmpTar, { force: true })
     }
   } catch (e) {
     logError(
@@ -118,16 +174,16 @@ async function restoreFile(
       const localHash = await hashFile(absolutePath)
       if (localHash === entry.hash) {
         // Apply permissions before returning cached
-        // Use test -L to avoid following symlinks (TOCTOU safety)
         try {
-          const isLink =
-            Bun.spawnSync(["test", "-L", absolutePath]).exitCode === 0
+          let isLink = false
+          try {
+            isLink = fs.lstatSync(absolutePath).isSymbolicLink()
+          } catch {}
           if (!isLink) {
-            const mode = parseInt(entry.mode, 8).toString(8)
-            const chmodProc = Bun.spawnSync(["chmod", mode, absolutePath])
-            if (!chmodProc.success || chmodProc.exitCode !== 0) {
-              // The content is already correct; a permission-sync failure
-              // (read-only fs, insufficient rights) should warn, not abort.
+            const mode = parseInt(entry.mode, 8)
+            try {
+              fs.chmodSync(absolutePath, mode)
+            } catch {
               warn(`Could not set permissions on ${path}`, "pull")
             }
           }
@@ -151,21 +207,18 @@ async function restoreFile(
       absolutePath.lastIndexOf("/") > 0
         ? absolutePath.substring(0, absolutePath.lastIndexOf("/"))
         : "/"
-    Bun.spawnSync(["mkdir", "-p", dir])
+    fs.mkdirSync(dir, { recursive: true })
 
     // Write file
     await Bun.write(absolutePath, data)
 
     // Set permissions
     try {
-      const mode = parseInt(entry.mode, 8).toString(8)
-      const chmodProc = Bun.spawnSync(["chmod", mode, absolutePath])
-      if (!chmodProc.success || chmodProc.exitCode !== 0) {
-        return "error"
-      }
+      const mode = parseInt(entry.mode, 8)
+      fs.chmodSync(absolutePath, mode)
     } catch {
-      // Permission set may fail on some systems
-      return "error"
+      // Permission set may fail on some systems — content is already in place.
+      warn(`Could not set permissions on ${path}`, "pull")
     }
 
     return "restored"
@@ -203,17 +256,12 @@ async function performPull(
   let manifest: Manifest | null = null
   try {
     if (specificManifest) {
-      // Check if user provided a .tar.gz key explicitly
-      if (specificManifest.endsWith(".tar.gz")) {
-        s.stop(
-          "Legacy tar backup specified — not supported in pull. Use clone for tar backups.",
-        )
-        p.cancel(
-          "Pull only supports manifest-based backups. Specify a .json manifest key or omit --backup.",
-        )
-        process.exit(1)
-      }
-      manifest = await downloadManifest(cfg.r2, specificManifest)
+      manifest = await resolveSpecificManifest(
+        cfg,
+        r2Prefix,
+        specificManifest,
+        s,
+      )
     } else {
       const latest = await getLatestManifest(cfg.r2, r2Prefix)
       if (latest) {

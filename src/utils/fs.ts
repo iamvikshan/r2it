@@ -1,3 +1,4 @@
+import fs from "node:fs"
 import { Glob } from "bun"
 
 export function homeDir(): string {
@@ -47,6 +48,14 @@ export function isPathUnderBase(path: string, baseDir: string): boolean {
  * Absolute paths (starting with /) pass through unchanged.
  * Relative paths are resolved against cwd.
  */
+function isAbsolutePath(p: string): boolean {
+  if (p.startsWith("/")) return true
+  if (p.length >= 3 && p[1] === ":" && (p[2] === "\\" || p[2] === "/"))
+    return true
+  if (p.startsWith("\\\\")) return true
+  return false
+}
+
 export function resolvePath(input: string, ctx: PathContext): string {
   let resolved = input
 
@@ -79,7 +88,7 @@ export function resolvePath(input: string, ctx: PathContext): string {
   }
 
   // Absolute path → pass through
-  if (resolved.startsWith("/")) {
+  if (isAbsolutePath(resolved)) {
     return resolved
   }
 
@@ -119,7 +128,8 @@ export function resolvePaths(
  */
 export async function checkPathExists(absolutePath: string): Promise<boolean> {
   try {
-    return await Bun.file(absolutePath).exists()
+    await fs.promises.access(absolutePath)
+    return true
   } catch {
     return false
   }
@@ -130,8 +140,7 @@ export async function checkPathExists(absolutePath: string): Promise<boolean> {
  */
 export function isSymlink(absolutePath: string): boolean {
   try {
-    const proc = Bun.spawnSync(["test", "-L", absolutePath])
-    return proc.exitCode === 0
+    return fs.lstatSync(absolutePath).isSymbolicLink()
   } catch {
     return false
   }
@@ -142,8 +151,7 @@ export function isSymlink(absolutePath: string): boolean {
  */
 export function isDirectory(absolutePath: string): boolean {
   try {
-    const proc = Bun.spawnSync(["test", "-d", absolutePath])
-    return proc.exitCode === 0
+    return fs.statSync(absolutePath).isDirectory()
   } catch {
     return false
   }

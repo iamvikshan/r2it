@@ -43,6 +43,7 @@ PUSH/PULL FLAGS
   -n, --dry-run             Print actions without executing
   -i, --interactive         Pick backup to pull interactively
   --keep <N>                Number of backups to keep (push only)
+  --prefix <p>              Override backup prefix (push/log only)
   --backup <key>            Specific backup key to pull (pull only)
 `)
   process.exit(status)
