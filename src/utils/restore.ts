@@ -1,4 +1,12 @@
-import { existsSync, chmodSync, mkdirSync, copyFileSync } from "node:fs"
+import {
+  existsSync,
+  chmodSync,
+  mkdirSync,
+  copyFileSync,
+  readlinkSync,
+  symlinkSync,
+  unlinkSync,
+} from "node:fs"
 import { checkPathExists } from "./fs"
 import { hashFile } from "./hash"
 import { warn } from "./log"
@@ -7,8 +15,9 @@ import type { ManifestEntry } from "./store-types"
 export type RestoreStatus = "restored" | "cached" | "error"
 
 /**
- * Restore a single file from an extracted archive to its final location.
- * Checks if local file already matches (by hash) before copying.
+ * Restore a single file or symlink from an extracted archive.
+ * For symlinks, recreates the link at the destination.
+ * For regular files, checks hash before copying.
  */
 export async function restoreSingleFile(
   absolutePath: string,
@@ -33,7 +42,28 @@ export async function restoreSingleFile(
 
   if (!sourcePath) return "error"
 
-  // Check if local already matches
+  // Symlink restoration
+  if (entry.type === "symlink-tar") {
+    try {
+      const linkTarget = readlinkSync(sourcePath)
+      // Remove existing file/link at destination
+      try {
+        unlinkSync(absolutePath)
+      } catch {}
+      const dir = absolutePath.substring(0, absolutePath.lastIndexOf("/"))
+      mkdirSync(dir, { recursive: true })
+      symlinkSync(linkTarget, absolutePath)
+      return "restored"
+    } catch (e) {
+      warn(
+        `Could not restore symlink ${absolutePath}: ${e instanceof Error ? e.message : String(e)}`,
+        "restore",
+      )
+      return "error"
+    }
+  }
+
+  // Regular file — check if local already matches
   const exists = await checkPathExists(absolutePath)
   if (exists) {
     try {
