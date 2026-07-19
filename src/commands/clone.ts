@@ -10,6 +10,7 @@ import { listObjects, downloadObject } from "../utils/r2"
 import { getLatestManifest, downloadObjectByHash } from "../utils/store"
 import { buildPathContext, resolvePath } from "../utils/fs"
 import { info, warn, error as logError, formatSize } from "../utils/log"
+import { restoreSymlinkTarFromR2 } from "../utils/symlink-restore"
 
 import type { Manifest } from "../utils/store-types"
 
@@ -21,53 +22,25 @@ async function restoreSymlinkTarEntry(
   entry: Manifest["entries"][string],
   r2Prefix: string,
   absolutePath: string,
+  path?: string,
 ): Promise<boolean> {
-  const data = await downloadObjectByHash(globalConfig.r2, entry.hash, r2Prefix)
-  const tmpDir = process.env.TMPDIR ?? process.env.TEMP ?? "/tmp"
-  const tmpTar = `${tmpDir}/r2git-symlink-${entry.hash}-${Date.now()}.tar`
-  const extractDir = `${tmpDir}/r2git-extract-${entry.hash}-${Date.now()}`
-  try {
-    await Bun.write(tmpTar, data)
-    fs.mkdirSync(extractDir, { recursive: true })
-    const extractProc = Bun.spawnSync(["tar", "-xf", tmpTar, "-C", extractDir])
-    if (!extractProc.success) return false
-    function findSymlinks(dir: string): string[] {
-      const results: string[] = []
-      try {
-        for (const entry of fs.readdirSync(dir, {
-          withFileTypes: true,
-          recursive: true,
-        })) {
-          if (entry.isSymbolicLink()) {
-            results.push(entry.parentPath + "/" + entry.name)
-          }
-        }
-      } catch {}
-      return results
-    }
-    const symlinks = findSymlinks(extractDir)
-    if (symlinks.length !== 1) return false
-    const extractedLink = symlinks[0]
-    if (!extractedLink) return false
-    const parentDir =
-      absolutePath.lastIndexOf("/") > 0
-        ? absolutePath.substring(0, absolutePath.lastIndexOf("/"))
-        : "/"
-    fs.mkdirSync(parentDir, { recursive: true })
-    fs.rmSync(absolutePath, { force: true, recursive: true })
-    try {
-      fs.cpSync(extractedLink, absolutePath, {
-        recursive: true,
-        dereference: false,
-      })
-      return true
-    } catch {
-      return false
-    }
-  } finally {
-    fs.rmSync(extractDir, { force: true, recursive: true })
-    fs.rmSync(tmpTar, { force: true })
+  const result = await restoreSymlinkTarFromR2(
+    globalConfig.r2,
+    entry,
+    r2Prefix,
+    absolutePath,
+  )
+  if (result.status === "success") {
+    return true
   }
+  // Log clone-specific error context
+  if (result.error) {
+    logError(
+      `Failed to restore symlink ${path ?? absolutePath}: ${result.error}`,
+      "clone",
+    )
+  }
+  return false
 }
 
 async function restoreFileEntry(
@@ -119,6 +92,7 @@ async function restoreFromManifest(
               entry,
               r2Prefix,
               absolutePath,
+              path,
             )
           : await restoreFileEntry(
               globalConfig,

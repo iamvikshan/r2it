@@ -146,7 +146,7 @@ async function gcUnreferencedObjects(
   try {
     allObjects = await listObjects(r2, `${projectPrefix}objects/`)
   } catch (e) {
-    debug(
+    info(
       `Failed to list objects for GC, aborting: ${e instanceof Error ? e.message : String(e)}`,
       "retention",
     )
@@ -198,7 +198,7 @@ async function collectReferencedHashes(
         referencedHashes.add(entry.hash)
       }
     } catch (e) {
-      debug(
+      info(
         `Failed to read manifest ${m.key} for GC, aborting object cleanup: ${e instanceof Error ? e.message : String(e)}`,
         "retention",
       )
@@ -219,7 +219,7 @@ async function deleteStaleManifests(
       deleted++
       info(`Deleted old manifest: ${m.key}`, "retention")
     } catch (e) {
-      debug(
+      info(
         `Failed to delete manifest ${m.key}, aborting: ${e instanceof Error ? e.message : String(e)}`,
         "retention",
       )
@@ -246,7 +246,7 @@ export async function enforceManifestRetention(
   try {
     manifests = await listManifests(r2, projectPrefix)
   } catch (e) {
-    debug(
+    info(
       `Failed to list manifests for retention, aborting: ${e instanceof Error ? e.message : String(e)}`,
       "retention",
     )

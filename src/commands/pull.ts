@@ -12,23 +12,9 @@ import {
   downloadManifest,
 } from "../utils/store"
 import { warn, error as logError, formatSize } from "../utils/log"
+import { restoreSymlinkTarFromR2 } from "../utils/symlink-restore"
 import type { ResolvedConfig } from "../utils/types"
 import type { Manifest, PullResult } from "../utils/store-types"
-
-function findSymlinks(dir: string): string[] {
-  const results: string[] = []
-  try {
-    for (const entry of fs.readdirSync(dir, {
-      withFileTypes: true,
-      recursive: true,
-    })) {
-      if (entry.isSymbolicLink()) {
-        results.push(entry.parentPath + "/" + entry.name)
-      }
-    }
-  } catch {}
-  return results
-}
 
 async function resolveSpecificManifest(
   cfg: ResolvedConfig,
@@ -64,7 +50,7 @@ async function resolveSpecificManifest(
 }
 
 /**
- * Restore a single file from the manifest.
+ * Restore a single symlink-tar file from the manifest.
  * Returns true if restored from R2, false if already correct locally.
  */
 async function restoreSymlinkTar(
@@ -87,64 +73,32 @@ async function restoreSymlinkTar(
     } catch {
       // Path doesn't exist or can't be read — proceed with download
     }
-    const data = await downloadObjectByHash(r2Config, entry.hash, projectPrefix)
-    // Write tar to temp and extract into isolated directory
-    const tmpDir = process.env.TMPDIR ?? process.env.TEMP ?? "/tmp"
-    const tmpTar = `${tmpDir}/r2git-symlink-${entry.hash}-${Date.now()}.tar`
-    const extractDir = `${tmpDir}/r2git-extract-${entry.hash}-${Date.now()}`
-    try {
-      await Bun.write(tmpTar, data)
-      fs.mkdirSync(extractDir, { recursive: true })
-      const extractProc = Bun.spawnSync([
-        "tar",
-        "-xf",
-        tmpTar,
-        "-C",
-        extractDir,
-      ])
-      if (!extractProc.success) {
-        logError(`Failed to extract symlink tar for ${path}`, "pull")
-        return "error"
-      }
-      // Validate that exactly one symlink was extracted
-      const symlinks = findSymlinks(extractDir)
-      if (symlinks.length !== 1) {
-        logError(
-          `Invalid symlink archive for ${path}: expected 1 symlink, found ${symlinks.length}`,
-          "pull",
-        )
-        return "error"
-      }
-      const extractedLink = symlinks[0]
-      if (!extractedLink) {
-        logError(`No symlink found in archive for ${path}`, "pull")
-        return "error"
-      }
-      // Ensure the destination parent exists (symlink-only nested paths
-      // may have no parent on a fresh machine), and clear any existing
-      // destination so a directory→symlink transition replaces the old
-      // directory instead of copying the link inside it.
-      const parentDir =
-        absolutePath.lastIndexOf("/") > 0
-          ? absolutePath.substring(0, absolutePath.lastIndexOf("/"))
-          : "/"
-      fs.mkdirSync(parentDir, { recursive: true })
-      fs.rmSync(absolutePath, { force: true, recursive: true })
-      // Install the validated symlink at the manifest-derived absolutePath
-      try {
-        fs.cpSync(extractedLink, absolutePath, {
-          recursive: true,
-          dereference: false,
-        })
-      } catch {
-        logError(`Failed to install symlink for ${path}`, "pull")
-        return "error"
-      }
+
+    // Use shared helper for restoration
+    const result = await restoreSymlinkTarFromR2(
+      r2Config,
+      entry,
+      projectPrefix,
+      absolutePath,
+    )
+
+    if (result.status === "success") {
       return "restored"
-    } finally {
-      fs.rmSync(extractDir, { force: true, recursive: true })
-      fs.rmSync(tmpTar, { force: true })
     }
+
+    // Log pull-specific error context based on status
+    if (result.status === "extract-failed") {
+      logError(`Failed to extract symlink tar for ${path}`, "pull")
+    } else if (result.status === "validation-failed") {
+      logError(
+        `Invalid symlink archive for ${path}: ${result.error ?? "validation failed"}`,
+        "pull",
+      )
+    } else if (result.status === "install-failed") {
+      logError(`Failed to install symlink for ${path}`, "pull")
+    }
+
+    return "error"
   } catch (e) {
     logError(
       `Failed to restore symlink ${path}: ${e instanceof Error ? e.message : String(e)}`,

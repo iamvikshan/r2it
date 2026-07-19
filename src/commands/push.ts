@@ -3,6 +3,7 @@ import { resolveActiveProjectConfig, projectR2Prefix } from "../utils/config"
 import { getCurrentDirBasename } from "../utils/git"
 import { resolvePaths, resolvePath, buildPathContext } from "../utils/fs"
 import { buildManifest, diffManifests } from "../utils/manifest"
+import { hashBuffer } from "../utils/hash"
 import {
   uploadObjectIfMissing,
   uploadManifest,
@@ -166,9 +167,21 @@ async function uploadObjects(
         data = obj.data
       } else {
         const entryPath = hashToPath.get(obj.hash)
-        if (!entryPath) continue
+        if (!entryPath) {
+          throw new Error(
+            `Invariant violation: no manifest path found for hash ${obj.hash.slice(0, 12)}`,
+          )
+        }
 
         data = await Bun.file(resolvePath(entryPath, pathContext)).arrayBuffer()
+
+        // Verify on-demand read matches manifest hash
+        const actualHash = hashBuffer(data)
+        if (actualHash !== obj.hash) {
+          throw new Error(
+            `Hash mismatch for ${entryPath}: expected ${obj.hash.slice(0, 12)}, got ${actualHash.slice(0, 12)}`,
+          )
+        }
       }
 
       const wasUploaded = await uploadObjectIfMissing(
