@@ -39,15 +39,19 @@ async function buildLocalManifest(cfg: ResolvedConfig): Promise<{
 
   for (const r of resolved) {
     try {
-      const { checkPathExists, getFileSize } = await import("../utils/fs")
-      const exists = await checkPathExists(r.absolute)
-      if (!exists) {
-        pathResults.push({
-          path: r.original,
-          status: "skipped",
-          reason: "file not found",
-        })
-        continue
+      const { checkPathExists, getFileSize, isSymlink } =
+        await import("../utils/fs")
+      const symlink = isSymlink(r.absolute)
+      if (!symlink) {
+        const exists = await checkPathExists(r.absolute)
+        if (!exists) {
+          pathResults.push({
+            path: r.original,
+            status: "skipped",
+            reason: "file not found",
+          })
+          continue
+        }
       }
       const size = await getFileSize(r.absolute)
       pathResults.push({

@@ -25,7 +25,7 @@ export async function restoreSymlinkTarFromR2(
     fs.mkdirSync(dir, { recursive: true })
 
     const proc = Bun.spawnSync(
-      ["tar", "-xzf", "-", "-C", "/", "--strip-components=0"],
+      ["tar", "-xf", "-", "-C", "/", "--strip-components=0"],
       { stdin: new Uint8Array(data) },
     )
     if (!proc.success) {
