@@ -9,7 +9,7 @@ import {
   unlinkSync,
 } from "node:fs"
 import { join } from "node:path"
-import { archiveEntryPath } from "./archive"
+import { archiveEntryPath, legacyArchiveEntryPath } from "./archive"
 import { checkPathExists } from "./fs"
 import { hashFile } from "./hash"
 import { warn } from "./log"
@@ -32,7 +32,8 @@ export async function restoreSingleFile(
     ? absolutePath.slice(1)
     : absolutePath
   const candidates = [
-    join(tmpDir, archiveEntryPath(originalPath)),
+    join(tmpDir, archiveEntryPath(entry.hash)),
+    join(tmpDir, legacyArchiveEntryPath(originalPath)),
     `${tmpDir}${absolutePath}`,
     join(tmpDir, stripped),
   ]

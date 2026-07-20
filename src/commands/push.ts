@@ -130,11 +130,23 @@ async function createAndUploadArchive(
 ): Promise<boolean> {
   const ctx = buildPathContext(cfg.project)
 
-  const pathsToArchive = resolvePaths(Object.keys(manifest.entries), ctx)
+  const pathsToArchive = resolvePaths(Object.keys(manifest.entries), ctx).map(
+    path => {
+      const entry = manifest.entries[path.original]
+      if (!entry) {
+        throw new Error(`Missing manifest entry for ${path.original}`)
+      }
+      return {
+        original: path.original,
+        absolute: path.absolute,
+        hash: entry.hash,
+      }
+    },
+  )
 
   const s = p.spinner()
   s.start("Creating archive...")
-  const { archive, errors: archiveErrors } = createArchive(pathsToArchive)
+  const { archive, errors: archiveErrors } = await createArchive(pathsToArchive)
 
   if (archiveErrors.length > 0) {
     for (const err of archiveErrors) {
