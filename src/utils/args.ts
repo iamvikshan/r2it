@@ -1,5 +1,32 @@
 import * as p from "@clack/prompts"
 
+const optionNames = new Set([
+  "--help",
+  "-h",
+  "--verbose",
+  "-v",
+  "--quiet",
+  "-q",
+  "--yes",
+  "-y",
+  "--dry-run",
+  "-n",
+  "--interactive",
+  "-i",
+  "--keep",
+  "--prefix",
+  "--backup",
+  "--min-age",
+  "--ignore",
+  "--doppler",
+  "--token",
+  "--config",
+  "-c",
+  "--project",
+  "-p",
+  "--json",
+])
+
 export function readOption(args: string[], name: string): string | undefined {
   const inlinePrefix = `${name}=`
   const matches = args.filter(
@@ -24,7 +51,7 @@ export function readOption(args: string[], name: string): string | undefined {
 
   const index = args.indexOf(name)
   const value = args[index + 1]
-  if (!value || value.startsWith("-")) {
+  if (!value || optionNames.has(value)) {
     p.cancel(`Error: ${name} requires a value`)
     process.exit(1)
   }
