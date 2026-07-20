@@ -6,7 +6,7 @@
 export type ObjectType = "file" | "symlink-tar"
 
 export type ManifestEntry = {
-  /** SHA-256 hash of the file content (or symlink tar content) */
+  /** SHA-256 hash of the file content or raw symlink target */
   hash: string
   /** Unix file permissions (e.g. "0644", "0755") */
   mode: string
@@ -14,7 +14,7 @@ export type ManifestEntry = {
   size: number
   /** Last modified timestamp (ISO 8601) */
   mtime: string
-  /** "file" for regular files, "symlink-tar" for individually tarred symlinks */
+  /** "file" for regular files; "symlink-tar" marks symlinks (legacy name) */
   type: ObjectType
 }
 
@@ -22,8 +22,8 @@ export type Manifest = {
   version: 1
   timestamp: string
   project: string
-  /** Previous manifest key (for history chain) */
-  parent: string | null
+  /** R2 key of the tar.gz archive containing all objects */
+  archiveKey: string
   entries: Record<string, ManifestEntry>
 }
 

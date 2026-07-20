@@ -1,16 +1,15 @@
 import type { Manifest, ManifestEntry, ObjectType } from "./store-types"
 import { hashFile, hashBuffer } from "./hash"
 import { checkPathExists, isSymlink, isDirectory, getFileSize } from "./fs"
-import fs from "node:fs"
-
-import { Glob } from "bun"
+import { lstatSync, readlinkSync, readdirSync } from "node:fs"
+import picomatch from "picomatch"
 
 /**
  * Get file mode as octal string (e.g. "0644").
  */
 function getFileMode(filePath: string): string {
   try {
-    const stat = fs.lstatSync(filePath)
+    const stat = lstatSync(filePath)
     return (stat.mode & 0o7777).toString(8).padStart(4, "0")
   } catch {
     return "0644"
@@ -22,33 +21,11 @@ function getFileMode(filePath: string): string {
  */
 function getFileMTime(filePath: string): string {
   try {
-    const stat = fs.lstatSync(filePath)
+    const stat = lstatSync(filePath)
     return new Date(stat.mtimeMs).toISOString()
   } catch {
     return new Date().toISOString()
   }
-}
-
-/**
- * Create a tar of a single symlink, preserving the link target.
- * Returns the tar buffer.
- */
-export function tarSymlink(filePath: string): Uint8Array {
-  const proc = Bun.spawnSync([
-    "tar",
-    "-cf",
-    "-",
-    "-C",
-    "/",
-    "--",
-    filePath.slice(1), // strip leading /
-  ])
-  if (!proc.success) {
-    throw new Error(
-      `Failed to tar symlink ${filePath}: ${proc.stderr.toString()}`,
-    )
-  }
-  return proc.stdout
 }
 
 /**
@@ -63,20 +40,21 @@ export async function buildEntry(
   const symlink = isSymlink(absolutePath)
 
   if (symlink || entryType === "symlink-tar") {
-    // Tar the symlink individually (works for dangling symlinks too)
-    const tarData = tarSymlink(absolutePath)
-    const hash = hashBuffer(tarData)
+    const linkTarget = Uint8Array.from(
+      readlinkSync(absolutePath, { encoding: "buffer" }),
+    )
+    const hash = hashBuffer(linkTarget)
     const mode = getFileMode(absolutePath)
     const mtime = getFileMTime(absolutePath)
     return {
       entry: {
         hash,
         mode,
-        size: tarData.length,
+        size: linkTarget.length,
         mtime,
         type: "symlink-tar",
       },
-      objectData: tarData,
+      objectData: linkTarget,
     }
   }
 
@@ -97,70 +75,109 @@ export async function buildEntry(
       mtime,
       type: "file",
     },
-    objectData: null, // caller reads the file directly for upload
+    objectData: null,
   }
+}
+
+function expandDirectory(
+  dirPath: string,
+  originalPrefix: string,
+  isIgnored: (path: string) => boolean,
+): {
+  expanded: Array<{ original: string; absolute: string }>
+  errors: Array<{ path: string; reason: string }>
+} {
+  const expanded: Array<{ original: string; absolute: string }> = []
+  const errors: Array<{ path: string; reason: string }> = []
+
+  function walk(currentDir: string, relativeDir: string): void {
+    let names: string[]
+    try {
+      names = readdirSync(currentDir)
+    } catch (e) {
+      errors.push({
+        path: relativeDir ? `${originalPrefix}/${relativeDir}` : originalPrefix,
+        reason: e instanceof Error ? e.message : String(e),
+      })
+      return
+    }
+
+    for (const name of names) {
+      const relativePath = relativeDir ? `${relativeDir}/${name}` : name
+      const originalPath = `${originalPrefix}/${relativePath}`
+      if (isIgnored(originalPath)) continue
+
+      const absolutePath = `${currentDir}/${name}`
+      try {
+        if (lstatSync(absolutePath).isDirectory()) {
+          walk(absolutePath, relativePath)
+          continue
+        }
+      } catch (e) {
+        errors.push({
+          path: originalPath,
+          reason: e instanceof Error ? e.message : String(e),
+        })
+        continue
+      }
+
+      expanded.push({ original: originalPath, absolute: absolutePath })
+    }
+  }
+
+  walk(dirPath, "")
+
+  return { expanded, errors }
+}
+
+function pathOrAncestorIgnored(
+  path: string,
+  isIgnored: (path: string) => boolean,
+): boolean {
+  const segments = path.split("/")
+  for (let index = segments.length; index > 0; index--) {
+    if (isIgnored(segments.slice(0, index).join("/"))) return true
+  }
+  return false
 }
 
 /**
  * Build a full manifest from resolved paths.
+ * @param ignores - glob patterns to exclude (matched against original paths)
  */
 export async function buildManifest(
   paths: Array<{ original: string; absolute: string }>,
   project: string,
-  parentKey: string | null,
+  ignores: string[] = [],
 ): Promise<{
   manifest: Manifest
-  objectDataMap: Map<string, Uint8Array>
   errors: Array<{ path: string; reason: string }>
 }> {
   const entries: Record<string, ManifestEntry> = {}
-  const objectDataMap = new Map<string, Uint8Array>()
   const errors: Array<{ path: string; reason: string }> = []
 
-  // Expand directories into individual files
+  const isIgnored =
+    ignores.length > 0
+      ? picomatch(ignores, { dot: true, matchBase: true })
+      : () => false
+
   const expandedPaths: Array<{ original: string; absolute: string }> = []
   for (const p of paths) {
-    // Check if symlink first, before directory check
     const symlink = isSymlink(p.absolute)
     if (symlink) {
-      // Symlinks (including those targeting directories) are stored as symlink-tar
-      expandedPaths.push(p)
+      if (!pathOrAncestorIgnored(p.original, isIgnored)) expandedPaths.push(p)
       continue
     }
 
-    const isDir = isDirectory(p.absolute)
-    if (isDir) {
-      // Recursively expand directory into individual file entries
-      try {
-        const glob = new Glob("**/*")
-        for (const entry of glob.scanSync({
-          cwd: p.absolute,
-          absolute: true,
-          onlyFiles: false, // Include symlinks
-          dot: true,
-        })) {
-          // Skip directory entries — only files and symlinks can be hashed
-          try {
-            if (fs.lstatSync(entry).isDirectory()) continue
-          } catch {
-            errors.push({
-              path: entry,
-              reason: "Failed to determine file type",
-            })
-            continue
-          }
-          const relPath = entry.slice(p.absolute.length).replace(/^\//, "")
-          const originalPath = `${p.original}/${relPath}`
-          expandedPaths.push({ original: originalPath, absolute: entry })
-        }
-      } catch (e) {
-        errors.push({
-          path: p.original,
-          reason: `Failed to expand directory: ${e instanceof Error ? e.message : String(e)}`,
-        })
+    if (isDirectory(p.absolute)) {
+      if (pathOrAncestorIgnored(p.original, isIgnored)) {
+        continue
       }
+      const result = expandDirectory(p.absolute, p.original, isIgnored)
+      expandedPaths.push(...result.expanded)
+      errors.push(...result.errors)
     } else {
-      expandedPaths.push(p)
+      if (!pathOrAncestorIgnored(p.original, isIgnored)) expandedPaths.push(p)
     }
   }
 
@@ -172,9 +189,6 @@ export async function buildManifest(
         continue
       }
       entries[p.original] = result.entry
-      if (result.objectData) {
-        objectDataMap.set(result.entry.hash, result.objectData)
-      }
     } catch (e) {
       errors.push({
         path: p.original,
@@ -183,15 +197,16 @@ export async function buildManifest(
     }
   }
 
-  const manifest: Manifest = {
-    version: 1,
-    timestamp: new Date().toISOString(),
-    project,
-    parent: parentKey,
-    entries,
+  return {
+    manifest: {
+      version: 1,
+      timestamp: new Date().toISOString(),
+      project,
+      archiveKey: "",
+      entries,
+    },
+    errors,
   }
-
-  return { manifest, objectDataMap, errors }
 }
 
 /**

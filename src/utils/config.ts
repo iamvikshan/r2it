@@ -1,4 +1,5 @@
 import { homeDir, resolvePaths, type PathContext } from "./fs"
+import { parseEnv } from "node:util"
 import type {
   BackupConfig,
   GlobalConfig,
@@ -23,34 +24,48 @@ export function localConfigFilePath(): string {
 
 export const DEFAULT_PATHS: string[] = ["{cwd}/.env"]
 
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value : undefined
+}
+
 export function defaultProject(_name: string): ProjectConfig {
   return {
     backup: {
       retention: 5,
       paths: [...DEFAULT_PATHS],
+      ignores: [],
     },
   }
 }
 
-export async function loadWorkspaceEnv(): Promise<void> {
+/**
+ * Detect R2 credentials in a .env file.
+ * Returns the found credentials or null if none found.
+ */
+export async function detectEnvCredentials(): Promise<{
+  accountId: string
+  accessKeyId: string
+  secretAccessKey: string
+  bucket?: string
+} | null> {
   const file = Bun.file(`${process.cwd()}/.env`)
-  if (await file.exists()) {
-    const text = await file.text()
-    for (const line of text.split("\n")) {
-      const trimmed = line.trim()
-      if (!trimmed || trimmed.startsWith("#")) continue
-      const idx = trimmed.indexOf("=")
-      if (idx !== -1) {
-        const k = trimmed.slice(0, idx).trim()
-        const v = trimmed.slice(idx + 1).trim()
-        const val =
-          (v.startsWith('"') && v.endsWith('"')) ||
-          (v.startsWith("'") && v.endsWith("'"))
-            ? v.slice(1, -1)
-            : v
-        process.env[k] = val
-      }
-    }
+  if (!(await file.exists())) return null
+
+  const env = parseEnv(await file.text())
+
+  const accountId = env.R2_ACCOUNT_ID ?? env.CLOUDFLARE_ACCOUNT_ID
+  const accessKeyId = env.R2_ACCESS_KEY_ID ?? env.CLOUDFLARE_ACCESS_KEY_ID
+  const secretAccessKey =
+    env.R2_SECRET_ACCESS_KEY ?? env.CLOUDFLARE_SECRET_ACCESS_KEY
+  const bucket = env.R2_BUCKET ?? env.CLOUDFLARE_R2_BUCKET
+
+  if (!accountId || !accessKeyId || !secretAccessKey) return null
+
+  return {
+    accountId,
+    accessKeyId,
+    secretAccessKey,
+    ...(bucket !== undefined && { bucket }),
   }
 }
 
@@ -59,14 +74,19 @@ export function defaultConfig(): GlobalConfig {
     activeProject: undefined,
     projects: {},
     r2: {
-      accountId: process.env.R2_ACCOUNT_ID ?? process.env.CLOUDFLARE_ACCOUNT_ID,
+      accountId:
+        nonEmptyString(process.env.R2_ACCOUNT_ID) ??
+        nonEmptyString(process.env.CLOUDFLARE_ACCOUNT_ID),
       accessKeyId:
-        process.env.R2_ACCESS_KEY_ID ?? process.env.CLOUDFLARE_ACCESS_KEY_ID,
+        nonEmptyString(process.env.R2_ACCESS_KEY_ID) ??
+        nonEmptyString(process.env.CLOUDFLARE_ACCESS_KEY_ID),
       secretAccessKey:
-        process.env.R2_SECRET_ACCESS_KEY ??
-        process.env.CLOUDFLARE_SECRET_ACCESS_KEY,
+        nonEmptyString(process.env.R2_SECRET_ACCESS_KEY) ??
+        nonEmptyString(process.env.CLOUDFLARE_SECRET_ACCESS_KEY),
       bucket:
-        process.env.R2_BUCKET ?? process.env.CLOUDFLARE_R2_BUCKET ?? "r2git",
+        nonEmptyString(process.env.R2_BUCKET) ??
+        nonEmptyString(process.env.CLOUDFLARE_R2_BUCKET) ??
+        "r2git",
     },
     dopplerToken: undefined,
   }
@@ -104,52 +124,67 @@ export async function migrateLegacyConfig(): Promise<void> {
   await tryMigrateFile(legacyMigrate, newPath)
 }
 
-type RawGlobalConfig = {
-  activeProject?: unknown
-  projects?: unknown
-  dopplerToken?: unknown
-  r2?: {
-    accountId?: unknown
-    accessKeyId?: unknown
-    secretAccessKey?: unknown
-    bucket?: unknown
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function normalizeBackupConfig(value: unknown): BackupConfig {
+  if (!isRecord(value)) {
+    return { retention: 5, paths: [...DEFAULT_PATHS], ignores: [] }
   }
+
+  const backup: BackupConfig = {
+    retention: typeof value.retention === "number" ? value.retention : 5,
+    paths: Array.isArray(value.paths)
+      ? value.paths.filter((path): path is string => typeof path === "string")
+      : [...DEFAULT_PATHS],
+    ignores: Array.isArray(value.ignores)
+      ? value.ignores.filter(
+          (pattern): pattern is string => typeof pattern === "string",
+        )
+      : [],
+  }
+  if (typeof value.prefix === "string") backup.prefix = value.prefix
+  return backup
+}
+
+function normalizeProjects(value: unknown): Record<string, ProjectConfig> {
+  if (!isRecord(value)) return {}
+
+  const projects: Record<string, ProjectConfig> = {}
+  for (const [name, project] of Object.entries(value)) {
+    projects[name] = {
+      backup: normalizeBackupConfig(
+        isRecord(project) ? project.backup : undefined,
+      ),
+    }
+  }
+  return projects
 }
 
 export async function loadGlobalConfig(): Promise<GlobalConfig> {
-  await loadWorkspaceEnv()
   await migrateLegacyConfig()
   const file = Bun.file(configFilePath())
   const exists = await file.exists()
   if (!exists) return defaultConfig()
 
   try {
-    const raw = JSON.parse(await file.text()) as RawGlobalConfig
+    const raw: unknown = JSON.parse(await file.text())
+    if (!isRecord(raw)) return defaultConfig()
     const def = defaultConfig()
-    const rawProjects = raw.projects as
-      | Record<string, ProjectConfig>
-      | undefined
+    const rawR2 = isRecord(raw.r2) ? raw.r2 : {}
     return {
       activeProject:
         typeof raw.activeProject === "string"
           ? raw.activeProject
           : def.activeProject,
-      projects: rawProjects ?? {},
+      projects: normalizeProjects(raw.projects),
       r2: {
-        accountId:
-          typeof raw.r2?.accountId === "string"
-            ? raw.r2.accountId
-            : def.r2.accountId,
-        accessKeyId:
-          typeof raw.r2?.accessKeyId === "string"
-            ? raw.r2.accessKeyId
-            : def.r2.accessKeyId,
+        accountId: nonEmptyString(rawR2.accountId) ?? def.r2.accountId,
+        accessKeyId: nonEmptyString(rawR2.accessKeyId) ?? def.r2.accessKeyId,
         secretAccessKey:
-          typeof raw.r2?.secretAccessKey === "string"
-            ? raw.r2.secretAccessKey
-            : def.r2.secretAccessKey,
-        bucket:
-          typeof raw.r2?.bucket === "string" ? raw.r2.bucket : def.r2.bucket,
+          nonEmptyString(rawR2.secretAccessKey) ?? def.r2.secretAccessKey,
+        bucket: nonEmptyString(rawR2.bucket) ?? def.r2.bucket,
       },
       dopplerToken:
         typeof raw.dopplerToken === "string"
@@ -163,11 +198,7 @@ export async function loadGlobalConfig(): Promise<GlobalConfig> {
 
 type RawLocalConfig = {
   project?: unknown
-  backup?: {
-    prefix?: unknown
-    retention?: unknown
-    paths?: unknown
-  }
+  backup?: unknown
 }
 
 export async function loadLocalConfig(): Promise<LocalConfig | null> {
@@ -175,21 +206,13 @@ export async function loadLocalConfig(): Promise<LocalConfig | null> {
   if (!(await file.exists())) return null
 
   try {
-    const raw = JSON.parse(await file.text()) as RawLocalConfig
+    const parsed: unknown = JSON.parse(await file.text())
+    if (!isRecord(parsed)) return null
+    const raw: RawLocalConfig = parsed
     if (typeof raw.project !== "string" || !raw.project) return null
-    const backup = raw.backup ?? {}
-    const resBackup: BackupConfig = {
-      retention: typeof backup.retention === "number" ? backup.retention : 5,
-      paths: Array.isArray(backup.paths)
-        ? (backup.paths as string[])
-        : [...DEFAULT_PATHS],
-    }
-    if (typeof backup.prefix === "string") {
-      resBackup.prefix = backup.prefix
-    }
     return {
       project: raw.project,
-      backup: resBackup,
+      backup: normalizeBackupConfig(raw.backup),
     }
   } catch {
     return null
@@ -199,25 +222,24 @@ export async function loadLocalConfig(): Promise<LocalConfig | null> {
 export async function resolveActiveProjectConfig(
   autoName: string,
 ): Promise<ResolvedConfig> {
-  await loadWorkspaceEnv()
   const global = await loadGlobalConfig()
   const local = await loadLocalConfig()
 
   const accountId =
-    process.env.R2_ACCOUNT_ID ??
-    process.env.CLOUDFLARE_ACCOUNT_ID ??
+    nonEmptyString(process.env.R2_ACCOUNT_ID) ??
+    nonEmptyString(process.env.CLOUDFLARE_ACCOUNT_ID) ??
     global.r2.accountId
   const accessKeyId =
-    process.env.R2_ACCESS_KEY_ID ??
-    process.env.CLOUDFLARE_ACCESS_KEY_ID ??
+    nonEmptyString(process.env.R2_ACCESS_KEY_ID) ??
+    nonEmptyString(process.env.CLOUDFLARE_ACCESS_KEY_ID) ??
     global.r2.accessKeyId
   const secretAccessKey =
-    process.env.R2_SECRET_ACCESS_KEY ??
-    process.env.CLOUDFLARE_SECRET_ACCESS_KEY ??
+    nonEmptyString(process.env.R2_SECRET_ACCESS_KEY) ??
+    nonEmptyString(process.env.CLOUDFLARE_SECRET_ACCESS_KEY) ??
     global.r2.secretAccessKey
   const bucket =
-    process.env.R2_BUCKET ??
-    process.env.CLOUDFLARE_R2_BUCKET ??
+    nonEmptyString(process.env.R2_BUCKET) ??
+    nonEmptyString(process.env.CLOUDFLARE_R2_BUCKET) ??
     global.r2.bucket
 
   const r2: R2Config = {

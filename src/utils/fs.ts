@@ -1,4 +1,4 @@
-import fs from "node:fs"
+import { lstatSync, statSync } from "node:fs"
 import { Glob } from "bun"
 
 export function homeDir(): string {
@@ -124,12 +124,14 @@ export function resolvePaths(
 
 /**
  * Check if a path exists. Accepts absolute paths directly.
- * The old version broke on absolute paths because it re-resolved them.
+ * Checks both files and directories.
  */
 export async function checkPathExists(absolutePath: string): Promise<boolean> {
   try {
-    await fs.promises.access(absolutePath)
-    return true
+    if (await Bun.file(absolutePath).exists()) {
+      return true
+    }
+    return isDirectory(absolutePath)
   } catch {
     return false
   }
@@ -140,7 +142,7 @@ export async function checkPathExists(absolutePath: string): Promise<boolean> {
  */
 export function isSymlink(absolutePath: string): boolean {
   try {
-    return fs.lstatSync(absolutePath).isSymbolicLink()
+    return lstatSync(absolutePath).isSymbolicLink()
   } catch {
     return false
   }
@@ -151,7 +153,7 @@ export function isSymlink(absolutePath: string): boolean {
  */
 export function isDirectory(absolutePath: string): boolean {
   try {
-    return fs.statSync(absolutePath).isDirectory()
+    return statSync(absolutePath).isDirectory()
   } catch {
     return false
   }

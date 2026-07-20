@@ -1,85 +1,51 @@
 import {
+  createUploadSink,
   uploadObject,
   downloadObject,
+  downloadObjectStream,
   listObjects,
-  headObject,
   deleteObject,
 } from "./r2"
-import { objectKey, hashBuffer } from "./hash"
 import type { R2Config } from "./types"
 import type { Manifest } from "./store-types"
 import { serializeManifest, deserializeManifest } from "./manifest"
-import { debug, info } from "./log"
+import { debug, info, warn } from "./log"
 
 /**
- * Check if an object exists in R2 by hash.
+ * Upload an archive to R2.
  */
-export async function objectExists(
+export function createArchiveUpload(
   r2: R2Config,
-  hash: string,
   projectPrefix: string,
-): Promise<boolean> {
-  const key = objectKey(hash, projectPrefix)
-  return headObject(r2, key)
+): {
+  key: string
+  open: () => ReturnType<typeof createUploadSink>
+} {
+  const key = archiveKey(projectPrefix)
+  return {
+    key,
+    open: () => createUploadSink(r2, key, "application/gzip"),
+  }
+}
+
+export async function deleteArchive(
+  r2: R2Config,
+  archiveKey: string,
+): Promise<void> {
+  await deleteObject(r2, archiveKey)
+  debug(`Deleted partial archive ${archiveKey}`, "store")
 }
 
 /**
- * Upload a single object to R2 if it doesn't already exist.
- * Returns true if uploaded, false if already present.
+ * Download an archive from R2.
  */
-export async function uploadObjectIfMissing(
+export async function downloadArchive(
   r2: R2Config,
-  hash: string,
-  data: ArrayBuffer | Uint8Array,
-  projectPrefix: string,
-): Promise<boolean> {
-  const key = objectKey(hash, projectPrefix)
-
-  // Verify content-addressed integrity: hash must match data
-  const actualHash = hashBuffer(data)
-  if (actualHash !== hash) {
-    throw new Error(
-      `Content-address verification failed for upload: expected ${hash}, got ${actualHash}`,
-    )
-  }
-
-  // Check existence first (avoid unnecessary uploads)
-  const exists = await headObject(r2, key)
-  if (exists) {
-    debug(`Object ${hash.slice(0, 12)}… already on R2, skipping`, "store")
-    return false
-  }
-
-  await uploadObject(r2, key, data, "application/octet-stream")
-  debug(`Uploaded object ${hash.slice(0, 12)}…`, "store")
-  return true
+  archiveKey: string,
+): Promise<{ stream: ReadableStream<Uint8Array>; size: number | null }> {
+  return downloadObjectStream(r2, archiveKey)
 }
 
-/**
- * Download a single object from R2 by hash.
- */
-export async function downloadObjectByHash(
-  r2: R2Config,
-  hash: string,
-  projectPrefix: string,
-): Promise<ArrayBuffer> {
-  const key = objectKey(hash, projectPrefix)
-  const data = await downloadObject(r2, key)
-
-  // Verify content-addressed integrity: downloaded data must match expected hash
-  const actualHash = hashBuffer(data)
-  if (actualHash !== hash) {
-    throw new Error(
-      `Content-address verification failed for download: expected ${hash}, got ${actualHash}`,
-    )
-  }
-
-  return data
-}
-
-/**
- * Upload a manifest to R2.
- */
 export async function uploadManifest(
   r2: R2Config,
   manifest: Manifest,
@@ -137,98 +103,12 @@ export async function getLatestManifest(
   return { manifest, key: latest.key }
 }
 
-async function gcUnreferencedObjects(
-  r2: R2Config,
-  projectPrefix: string,
-  referencedHashes: Set<string>,
-): Promise<void> {
-  let allObjects: Array<{ key: string; lastModified: string; size: number }>
-  try {
-    allObjects = await listObjects(r2, `${projectPrefix}objects/`)
-  } catch (e) {
-    info(
-      `Failed to list objects for GC, aborting: ${e instanceof Error ? e.message : String(e)}`,
-      "retention",
-    )
-    return
-  }
-
-  let gcDeleted = 0
-  for (const obj of allObjects) {
-    const parts = obj.key.split("/")
-    const hash =
-      parts.length >= 3
-        ? (parts[parts.length - 2] ?? "") + (parts[parts.length - 1] ?? "")
-        : ""
-
-    if (hash && !referencedHashes.has(hash)) {
-      try {
-        await deleteObject(r2, obj.key)
-        gcDeleted++
-        debug(
-          `GC deleted unreferenced object: ${hash.slice(0, 12)}…`,
-          "retention",
-        )
-      } catch (e) {
-        debug(
-          `Failed to delete object ${obj.key}: ${e instanceof Error ? e.message : String(e)}`,
-          "retention",
-        )
-      }
-    }
-  }
-
-  if (gcDeleted > 0) {
-    info(`Garbage collected ${gcDeleted} unreferenced object(s)`, "retention")
-  }
-}
-
 /**
- * Enforce retention on manifests. Deletes old manifests and their orphaned objects.
+ * Enforce retention on manifests and their archives.
+ * Deletes the manifest first, then its archive. If manifest deletion succeeds
+ * but archive deletion fails, the archive is orphaned but the backup is no
+ * longer selectable — safer than the reverse order.
  */
-async function collectReferencedHashes(
-  r2: R2Config,
-  manifests: Array<{ key: string; lastModified: string; size: number }>,
-): Promise<Set<string> | null> {
-  const referencedHashes = new Set<string>()
-  for (const m of manifests) {
-    try {
-      const manifest = await downloadManifest(r2, m.key)
-      for (const entry of Object.values(manifest.entries)) {
-        referencedHashes.add(entry.hash)
-      }
-    } catch (e) {
-      info(
-        `Failed to read manifest ${m.key} for GC, aborting object cleanup: ${e instanceof Error ? e.message : String(e)}`,
-        "retention",
-      )
-      return null
-    }
-  }
-  return referencedHashes
-}
-
-async function deleteStaleManifests(
-  r2: R2Config,
-  stale: Array<{ key: string; lastModified: string; size: number }>,
-): Promise<number> {
-  let deleted = 0
-  for (const m of stale) {
-    try {
-      await deleteObject(r2, m.key)
-      deleted++
-      info(`Deleted old manifest: ${m.key}`, "retention")
-    } catch (e) {
-      info(
-        `Failed to delete manifest ${m.key}, aborting: ${e instanceof Error ? e.message : String(e)}`,
-        "retention",
-      )
-      return deleted
-    }
-  }
-  return deleted
-}
-
 export async function enforceManifestRetention(
   r2: R2Config,
   projectPrefix: string,
@@ -256,21 +136,130 @@ export async function enforceManifestRetention(
   if (manifests.length <= retention) return 0
 
   const stale = manifests.slice(retention)
-  const retained = manifests.slice(0, retention)
 
-  const referencedHashes = await collectReferencedHashes(r2, retained)
-  if (!referencedHashes) return 0
+  let deleted = 0
+  for (const m of stale) {
+    let archiveKeyToDelete: string | undefined
 
-  const deleted = await deleteStaleManifests(r2, stale)
-  if (deleted === stale.length) {
-    await gcUnreferencedObjects(r2, projectPrefix, referencedHashes)
+    try {
+      // Read the manifest to find its archive key
+      const manifest = await downloadManifest(r2, m.key)
+      archiveKeyToDelete = manifest.archiveKey
+    } catch (e) {
+      // If we can't read the manifest, abort this entry — don't risk
+      // deleting an archive that might still be referenced
+      info(
+        `Failed to read manifest ${m.key} for cleanup, skipping: ${e instanceof Error ? e.message : String(e)}`,
+        "retention",
+      )
+      continue
+    }
+
+    try {
+      // Delete the manifest first — if this succeeds, the backup is no
+      // longer selectable even if archive deletion fails
+      await deleteObject(r2, m.key)
+      deleted++
+      info(`Deleted old manifest: ${m.key}`, "retention")
+    } catch (e) {
+      info(
+        `Failed to delete manifest ${m.key}: ${e instanceof Error ? e.message : String(e)}`,
+        "retention",
+      )
+      continue
+    }
+
+    // Now safe to delete the archive
+    if (archiveKeyToDelete) {
+      try {
+        await deleteObject(r2, archiveKeyToDelete)
+        debug(`Deleted archive ${archiveKeyToDelete}`, "retention")
+      } catch (e) {
+        debug(
+          `Failed to delete archive ${archiveKeyToDelete}: ${e instanceof Error ? e.message : String(e)}`,
+          "retention",
+        )
+      }
+    }
   }
 
   return deleted
+}
+
+function archiveKey(projectPrefix: string): string {
+  const suffix = Math.random().toString(36).substring(2, 8)
+  const ts = new Date().toISOString().replace(/[:.]/g, "-")
+  return `${projectPrefix}archives/${ts}-${suffix}.tar.gz`
 }
 
 function manifestKey(timestamp: string, projectPrefix: string): string {
   const sanitized = timestamp.replace(/[:.]/g, "-")
   const suffix = Math.random().toString(36).substring(2, 8)
   return `${projectPrefix}manifests/${sanitized}-${suffix}.json`
+}
+
+export type CleanupResult = {
+  candidates: number
+  deleted: number
+}
+
+export async function cleanupOrphanedArchives(
+  r2: R2Config,
+  projectPrefix: string,
+  options: { dryRun: boolean; minAgeMs: number },
+): Promise<CleanupResult> {
+  let manifests: Array<{ key: string; lastModified: string; size: number }>
+  try {
+    manifests = await listManifests(r2, projectPrefix)
+  } catch (e) {
+    warn(
+      `Failed to list manifests for cleanup, aborting: ${e instanceof Error ? e.message : String(e)}`,
+      "cleanup",
+    )
+    return { candidates: 0, deleted: 0 }
+  }
+
+  const referencedArchives = new Set<string>()
+  for (const item of manifests) {
+    try {
+      const manifest = await downloadManifest(r2, item.key)
+      if (manifest.archiveKey) referencedArchives.add(manifest.archiveKey)
+    } catch (e) {
+      warn(
+        `Failed to download manifest ${item.key} for cleanup, aborting: ${e instanceof Error ? e.message : String(e)}`,
+        "cleanup",
+      )
+      return { candidates: 0, deleted: 0 }
+    }
+  }
+
+  const archivePrefix = `${projectPrefix}archives/`
+  const allArchives = await listObjects(r2, archivePrefix)
+  const cutoff = Date.now() - options.minAgeMs
+  const candidates = allArchives.filter(archive => {
+    const modified = new Date(archive.lastModified).getTime()
+    return (
+      Number.isFinite(modified) &&
+      modified <= cutoff &&
+      !referencedArchives.has(archive.key)
+    )
+  })
+
+  let deleted = 0
+  if (!options.dryRun) {
+    for (const archive of candidates) {
+      try {
+        await deleteObject(r2, archive.key)
+        deleted++
+        info(`Deleted orphaned archive: ${archive.key}`, "cleanup")
+      } catch (e) {
+        warn(
+          `Could not delete orphaned archive ${archive.key}: ${e instanceof Error ? e.message : String(e)}`,
+          "cleanup",
+        )
+      }
+    }
+  }
+
+  return { candidates: candidates.length, deleted }
 }
