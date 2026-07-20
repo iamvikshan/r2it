@@ -1,4 +1,5 @@
-import { lstatSync, mkdirSync, readlinkSync } from "node:fs"
+import { lstatSync, mkdirSync, readlinkSync, readdirSync, rmSync } from "node:fs"
+import { join } from "node:path"
 import type { UploadSink } from "./r2"
 
 const TAR_BLOCK_SIZE = 512
@@ -53,13 +54,19 @@ function writeTarOctal(
   offset: number,
   length: number,
   value: number,
-): void {
-  const normalized = Math.max(0, Math.trunc(value))
-  const octal = normalized.toString(8)
+): { needsPaxMtime?: boolean } {
+  const truncated = Math.trunc(value)
+  if (truncated < 0) {
+    // Negative mtime: caller must emit PAX record
+    writeTarString(target, offset, length, `${Array(length - 1).fill("0").join("")}\0`)
+    return { needsPaxMtime: true }
+  }
+  const octal = truncated.toString(8)
   if (octal.length > length - 1) {
     throw new Error(`Tar numeric field exceeds ${length} bytes: ${value}`)
   }
   writeTarString(target, offset, length, `${octal.padStart(length - 1, "0")}\0`)
+  return {}
 }
 
 function createTarHeader(
@@ -69,14 +76,14 @@ function createTarHeader(
     size?: number
     typeFlag?: number
   } = {},
-): Uint8Array<ArrayBuffer> {
+): { header: Uint8Array<ArrayBuffer>; needsPaxMtime?: boolean } {
   const header = new Uint8Array(new ArrayBuffer(TAR_BLOCK_SIZE))
   writeTarString(header, 0, 100, options.archivePath ?? entry.archivePath)
   writeTarOctal(header, 100, 8, entry.mode)
   writeTarOctal(header, 108, 8, 0)
   writeTarOctal(header, 116, 8, 0)
   writeTarOctal(header, 124, 12, options.size ?? entry.size)
-  writeTarOctal(header, 136, 12, Math.floor(entry.mtimeMs / 1000))
+  const mtimeResult = writeTarOctal(header, 136, 12, Math.floor(entry.mtimeMs / 1000))
   header.fill(0x20, 148, 156)
   header[156] = options.typeFlag ?? 0x30
   writeTarString(header, 257, 6, "ustar\0")
@@ -85,7 +92,10 @@ function createTarHeader(
   let checksum = 0
   for (const byte of header) checksum += byte
   writeTarString(header, 148, 8, `${checksum.toString(8).padStart(6, "0")}\0 `)
-  return header
+  if (mtimeResult.needsPaxMtime !== undefined) {
+    return { header, needsPaxMtime: mtimeResult.needsPaxMtime }
+  }
+  return { header }
 }
 
 function createPaxRecord(key: string, value: string): Uint8Array<ArrayBuffer> {
@@ -193,26 +203,40 @@ export async function createArchive(
 
   try {
     for (const entry of entries) {
+      const paxRecords: string[] = []
+
       if (entry.size > TAR_SIZE_MAX) {
-        const paxData = createPaxRecord("size", String(entry.size))
-        await writer.write(
-          createTarHeader(entry, {
-            archivePath: `PaxHeaders/${entry.expectedHash}`,
-            size: paxData.length,
-            typeFlag: 0x78,
-          }),
-        )
+        paxRecords.push(`size=${String(entry.size)}`)
+      }
+
+      const mtimeSec = Math.floor(entry.mtimeMs / 1000)
+      if (mtimeSec < 0) {
+        paxRecords.push(`mtime=${(entry.mtimeMs / 1000).toFixed(9)}`)
+      }
+
+      if (paxRecords.length > 0) {
+        let paxBody = ""
+        for (const record of paxRecords) {
+          const paxRec = createPaxRecord(record.split("=")[0] ?? "", record.split("=")[1] ?? "")
+          paxBody += new TextDecoder().decode(paxRec)
+        }
+        const paxData = textEncoder.encode(paxBody)
+        const paxHdr = createTarHeader(entry, {
+          archivePath: `PaxHeaders/${entry.expectedHash}`,
+          size: paxData.length,
+          typeFlag: 0x78,
+        })
+        await writer.write(paxHdr.header)
         await writer.write(paxData)
         const paxPadding =
           (TAR_BLOCK_SIZE - (paxData.length % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE
         if (paxPadding > 0) await writer.write(new Uint8Array(paxPadding))
       }
 
-      await writer.write(
-        createTarHeader(entry, {
-          size: entry.size > TAR_SIZE_MAX ? 0 : entry.size,
-        }),
-      )
+      const mainHdr = createTarHeader(entry, {
+        size: entry.size > TAR_SIZE_MAX ? 0 : entry.size,
+      })
+      await writer.write(mainHdr.header)
       let writtenBytes = 0
       const hasher = new Bun.CryptoHasher("sha256")
 
@@ -267,34 +291,156 @@ export async function extractArchive(
   targetDir: string,
 ): Promise<{ errors: Array<{ path: string; reason: string }> }> {
   const errors: Array<{ path: string; reason: string }> = []
-  mkdirSync(targetDir, { recursive: true })
 
-  const proc = Bun.spawn(["tar", "-xzf", "-", "-C", targetDir], {
-    stdin: "pipe",
-    stdout: "ignore",
-    stderr: "pipe",
-  })
+  // Harden setup failures
+  try {
+    mkdirSync(targetDir, { recursive: true })
+  } catch (e) {
+    errors.push({
+      path: targetDir,
+      reason: `Failed to create target directory: ${e instanceof Error ? e.message : String(e)}`,
+    })
+    return { errors }
+  }
+
+  let proc: ReturnType<typeof Bun.spawn>
+  try {
+    proc = Bun.spawn(["tar", "-xzf", "-", "-C", targetDir], {
+      stdin: "pipe",
+      stdout: "ignore",
+      stderr: "pipe",
+    })
+  } catch (e) {
+    errors.push({
+      path: targetDir,
+      reason: `Failed to spawn tar: ${e instanceof Error ? e.message : String(e)}`,
+    })
+    return { errors }
+  }
+
   const reader = archive.getReader()
+
+  // Begin draining stderr immediately
+  const stderrPromise = new Response(proc.stderr as ReadableStream<Uint8Array>).text()
+
+  const stdin = proc.stdin
+  if (!stdin || typeof stdin === "number") {
+    errors.push({
+      path: targetDir,
+      reason: "Failed to get stdin pipe from tar process",
+    })
+    return { errors }
+  }
 
   try {
     for (;;) {
       const { done, value } = await reader.read()
       if (done) break
-      await proc.stdin.write(value)
+      await stdin.write(value)
     }
-    await proc.stdin.end()
+    await stdin.end()
   } catch (e) {
     await reader.cancel(e).catch(() => undefined)
     await Promise.resolve(
-      proc.stdin.end(e instanceof Error ? e : new Error(String(e))),
+      stdin.end(e instanceof Error ? e : new Error(String(e))),
     ).catch(() => undefined)
   }
 
   const exitCode = await proc.exited
   if (exitCode !== 0) {
-    const stderr = (await new Response(proc.stderr).text()).trim()
+    const stderr = (await stderrPromise).trim()
     errors.push({ path: targetDir, reason: `Extraction failed: ${stderr}` })
+    return { errors }
+  }
+
+  // Validate extracted archive members: only allow regular files and directories
+  // under entries/<hash> or entries/<base64url>, reject symlinks, hardlinks, and special files
+  try {
+    validateExtractedArchive(targetDir, errors)
+  } catch (e) {
+    errors.push({
+      path: targetDir,
+      reason: `Validation failed: ${e instanceof Error ? e.message : String(e)}`,
+    })
   }
 
   return { errors }
+}
+
+function validateExtractedArchive(
+  targetDir: string,
+  errors: Array<{ path: string; reason: string }>,
+): void {
+  function walkAndValidate(dir: string, relativePath: string): void {
+    let entries: string[]
+    try {
+      entries = readdirSync(dir)
+    } catch (e) {
+      errors.push({
+        path: relativePath,
+        reason: `Cannot read directory: ${e instanceof Error ? e.message : String(e)}`,
+      })
+      return
+    }
+
+    for (const entry of entries) {
+      const fullPath = join(dir, entry)
+      const relPath = relativePath ? `${relativePath}/${entry}` : entry
+
+      try {
+        const stat = lstatSync(fullPath)
+
+        // Check if path is within allowed prefixes
+        const isUnderEntries = relPath.startsWith("entries/")
+        const isEntriesDir = relPath === "entries"
+        const isPaxHeaders = relPath.startsWith("PaxHeaders/")
+
+        if (!isUnderEntries && !isEntriesDir && !isPaxHeaders) {
+          errors.push({
+            path: relPath,
+            reason: "Archive member outside entries/ directory",
+          })
+          try {
+            rmSync(fullPath, { recursive: true, force: true })
+          } catch {}
+          continue
+        }
+
+        // Reject symlinks, special files, and anything that's not a regular file or directory
+        if (stat.isSymbolicLink()) {
+          errors.push({
+            path: relPath,
+            reason: "Symlinks not allowed in archive",
+          })
+          try {
+            rmSync(fullPath, { recursive: true, force: true })
+          } catch {}
+          continue
+        }
+
+        if (!stat.isFile() && !stat.isDirectory()) {
+          errors.push({
+            path: relPath,
+            reason: "Special file type not allowed in archive",
+          })
+          try {
+            rmSync(fullPath, { recursive: true, force: true })
+          } catch {}
+          continue
+        }
+
+        // Recurse into directories
+        if (stat.isDirectory()) {
+          walkAndValidate(fullPath, relPath)
+        }
+      } catch (e) {
+        errors.push({
+          path: relPath,
+          reason: `Validation error: ${e instanceof Error ? e.message : String(e)}`,
+        })
+      }
+    }
+  }
+
+  walkAndValidate(targetDir, "")
 }

@@ -105,7 +105,7 @@ function expandDirectory(
     for (const name of names) {
       const relativePath = relativeDir ? `${relativeDir}/${name}` : name
       const originalPath = `${originalPrefix}/${relativePath}`
-      if (pathOrAncestorIgnored(originalPath, isIgnored)) continue
+      if (isIgnored(originalPath)) continue
 
       const absolutePath = `${currentDir}/${name}`
       try {

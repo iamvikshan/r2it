@@ -7,11 +7,12 @@ import {
   readlinkSync,
   symlinkSync,
   unlinkSync,
+  realpathSync,
 } from "node:fs"
-import { join } from "node:path"
+import { join, resolve, dirname } from "node:path"
 import { archiveEntryPath, legacyArchiveEntryPath } from "./archive"
 import { checkPathExists } from "./fs"
-import { hashFile } from "./hash"
+import { hashFile, hashBuffer } from "./hash"
 import { warn } from "./log"
 import type { ManifestEntry } from "./store-types"
 
@@ -28,6 +29,9 @@ export async function restoreSingleFile(
   entry: ManifestEntry,
   tmpDir: string,
 ): Promise<RestoreStatus> {
+  // Resolve tmpDir to canonical path for validation
+  const canonicalTmpDir = realpathSync(tmpDir)
+
   const stripped = absolutePath.startsWith("/")
     ? absolutePath.slice(1)
     : absolutePath
@@ -37,10 +41,25 @@ export async function restoreSingleFile(
     `${tmpDir}${absolutePath}`,
     join(tmpDir, stripped),
   ]
+
   let sourcePath: string | undefined
   for (const candidate of candidates) {
     try {
-      lstatSync(candidate)
+      const stat = lstatSync(candidate)
+
+      // Resolve candidate and validate it's within tmpDir
+      const resolvedCandidate = realpathSync(candidate)
+      if (!resolvedCandidate.startsWith(canonicalTmpDir + "/") && resolvedCandidate !== canonicalTmpDir) {
+        warn(`Candidate ${candidate} resolves outside tmpDir, skipping`, "restore")
+        continue
+      }
+
+      // For regular files, require the source to be a regular file (not a symlink)
+      if (entry.type !== "symlink-tar" && !stat.isFile()) {
+        warn(`Candidate ${candidate} is not a regular file, skipping`, "restore")
+        continue
+      }
+
       sourcePath = candidate
       break
     } catch {
@@ -56,6 +75,24 @@ export async function restoreSingleFile(
       const linkTarget = sourceStat.isSymbolicLink()
         ? readlinkSync(sourcePath, { encoding: "buffer" })
         : readFileSync(sourcePath)
+
+      // Validate symlink target hash and size match manifest
+      const actualHash = hashBuffer(linkTarget)
+      if (actualHash !== entry.hash) {
+        warn(
+          `Symlink ${originalPath} hash mismatch: expected ${entry.hash}, got ${actualHash}`,
+          "restore",
+        )
+        return "error"
+      }
+      if (linkTarget.length !== entry.size) {
+        warn(
+          `Symlink ${originalPath} size mismatch: expected ${entry.size}, got ${linkTarget.length}`,
+          "restore",
+        )
+        return "error"
+      }
+
       try {
         unlinkSync(absolutePath)
       } catch {}
@@ -72,6 +109,33 @@ export async function restoreSingleFile(
     }
   }
 
+  // Validate source file hash and size match manifest before copying
+  try {
+    const sourceStat = lstatSync(sourcePath)
+    if (sourceStat.size !== entry.size) {
+      warn(
+        `File ${originalPath} size mismatch in archive: expected ${entry.size}, got ${sourceStat.size}`,
+        "restore",
+      )
+      return "error"
+    }
+
+    const sourceHash = await hashFile(sourcePath)
+    if (sourceHash !== entry.hash) {
+      warn(
+        `File ${originalPath} hash mismatch in archive: expected ${entry.hash}, got ${sourceHash}`,
+        "restore",
+      )
+      return "error"
+    }
+  } catch (e) {
+    warn(
+      `Failed to validate source file ${sourcePath}: ${e instanceof Error ? e.message : String(e)}`,
+      "restore",
+    )
+    return "error"
+  }
+
   const exists = await checkPathExists(absolutePath)
   if (exists) {
     try {
@@ -85,8 +149,49 @@ export async function restoreSingleFile(
     } catch {}
   }
 
+  // Validate destination path: reject symlinks in parent directories
   const dir = absolutePath.substring(0, absolutePath.lastIndexOf("/"))
-  mkdirSync(dir, { recursive: true })
+  try {
+    mkdirSync(dir, { recursive: true })
+
+    // Check each component of the path to ensure no symlinks
+    let checkPath = dir
+    const components = checkPath.split("/").filter(c => c)
+    let builtPath = ""
+    for (const component of components) {
+      builtPath += "/" + component
+      try {
+        const stat = lstatSync(builtPath)
+        if (stat.isSymbolicLink()) {
+          warn(
+            `Destination path ${absolutePath} contains symlink component ${builtPath}`,
+            "restore",
+          )
+          return "error"
+        }
+      } catch {
+        // Path doesn't exist yet, that's OK
+      }
+    }
+  } catch (e) {
+    warn(
+      `Failed to create directory ${dir}: ${e instanceof Error ? e.message : String(e)}`,
+      "restore",
+    )
+    return "error"
+  }
+
+  // Check if destination is a symlink before copying
+  try {
+    const destStat = lstatSync(absolutePath)
+    if (destStat.isSymbolicLink()) {
+      warn(`Destination ${absolutePath} is a symlink, removing before copy`, "restore")
+      unlinkSync(absolutePath)
+    }
+  } catch {
+    // File doesn't exist, that's fine
+  }
+
   copyFileSync(sourcePath, absolutePath)
   try {
     chmodSync(absolutePath, parseInt(entry.mode, 8))

@@ -208,11 +208,29 @@ export async function cleanupOrphanedArchives(
   projectPrefix: string,
   options: { dryRun: boolean; minAgeMs: number },
 ): Promise<CleanupResult> {
-  const manifests = await listManifests(r2, projectPrefix)
+  let manifests: Array<{ key: string; lastModified: string; size: number }>
+  try {
+    manifests = await listManifests(r2, projectPrefix)
+  } catch (e) {
+    warn(
+      `Failed to list manifests for cleanup, aborting: ${e instanceof Error ? e.message : String(e)}`,
+      "cleanup",
+    )
+    return { candidates: 0, deleted: 0 }
+  }
+
   const referencedArchives = new Set<string>()
   for (const item of manifests) {
-    const manifest = await downloadManifest(r2, item.key)
-    if (manifest.archiveKey) referencedArchives.add(manifest.archiveKey)
+    try {
+      const manifest = await downloadManifest(r2, item.key)
+      if (manifest.archiveKey) referencedArchives.add(manifest.archiveKey)
+    } catch (e) {
+      warn(
+        `Failed to download manifest ${item.key} for cleanup, aborting: ${e instanceof Error ? e.message : String(e)}`,
+        "cleanup",
+      )
+      return { candidates: 0, deleted: 0 }
+    }
   }
 
   const archivePrefix = `${projectPrefix}archives/`
